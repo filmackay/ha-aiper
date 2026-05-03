@@ -71,8 +71,10 @@ jobs:
             name="$1"
             outcome="$2"
             if [ "$outcome" = "success" ]; then
+              echo "PASSED: ${name}"
               echo "::notice title=${name}::passed"
             else
+              echo "FAILED: ${name} (outcome=${outcome})"
               echo "::error title=${name} failed::outcome=${outcome}"
               failed=1
             fi

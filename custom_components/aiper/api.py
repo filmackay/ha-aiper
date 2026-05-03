@@ -597,7 +597,10 @@ class AiperApi:
 
         try:
             for body in self._cleaning_history_bodies(sn):
-                data = await self._call_with_zoneid(sn, lambda body=body: _do(body))
+                async def call_history(body: dict[str, Any] = body) -> Any:
+                    return await _do(body)
+
+                data = await self._call_with_zoneid(sn, call_history)
                 if data:
                     return data
             return {}
@@ -689,18 +692,24 @@ class AiperApi:
             for body in bodies:
                 payload = None
                 try:
+                    async def call_encrypted(path: str = path, body: dict[str, Any] = body) -> dict[str, Any]:
+                        return await self._call_encrypted("POST", path, body)
+
                     payload = await self._call_with_zoneid(
                         sn,
-                        lambda path=path, body=body: self._call_encrypted("POST", path, body),
+                        call_encrypted,
                     )
                 except Exception as err:
                     _LOGGER.debug("Clean path query encrypted call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     try:
+                        async def call_plain(path: str = path, body: dict[str, Any] = body) -> dict[str, Any]:
+                            return await self._call_plain("POST", path, body)
+
                         payload = await self._call_with_zoneid(
                             sn,
-                            lambda path=path, body=body: self._call_plain("POST", path, body),
+                            call_plain,
                         )
                     except Exception as err:
                         _LOGGER.debug("Clean path query plain call failed (%s): %s", path, err)
@@ -796,18 +805,24 @@ class AiperApi:
             for body in bodies:
                 payload = None
                 try:
+                    async def call_encrypted(path: str = path, body: dict[str, Any] = body) -> dict[str, Any]:
+                        return await self._call_encrypted("POST", path, body)
+
                     payload = await self._call_with_zoneid(
                         sn,
-                        lambda path=path, body=body: self._call_encrypted("POST", path, body),
+                        call_encrypted,
                     )
                 except Exception as err:
                     _LOGGER.debug("Clean path update encrypted call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     try:
+                        async def call_plain(path: str = path, body: dict[str, Any] = body) -> dict[str, Any]:
+                            return await self._call_plain("POST", path, body)
+
                         payload = await self._call_with_zoneid(
                             sn,
-                            lambda path=path, body=body: self._call_plain("POST", path, body),
+                            call_plain,
                         )
                     except Exception as err:
                         _LOGGER.debug("Clean path update plain call failed (%s): %s", path, err)
