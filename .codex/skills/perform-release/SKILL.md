@@ -1,142 +1,121 @@
 ---
 name: perform-release
-description: Perform a release for this ha-aiper repository. Use when the user asks to create, prepare, cut, tag, publish, or run a patch/minor/major release for the HACS Home Assistant Aiper integration, including version bumping, committing, pushing, creating the v* tag, and following the GitHub release action.
+description: Perform a release for this repository. Use when the user asks to create, prepare, cut, tag, publish, bump or run a patch/minor/major release for the HACS Home Assistant Aiper integration by bumping repo versions and letting the CI/CD workflow tag and publish after validation passes.
 ---
 
 # Perform Release
 
-Release this HACS integration by bumping the repo versions, committing the bump,
-pushing `main`, pushing a `v*` tag, and following the tag-triggered release action.
+Release this HACS integration by committing a version bump to `main`. The
+`CI/CD` workflow validates that the stored versions match, runs quality checks,
+and only then tags the current commit and creates the GitHub release archive.
+
+Do not create tags locally. Do not run a separate release workflow.
 
 ## Release Type
 
-- Default to a patch release.
-- If the user asks for `minor` or `major`, bump that SemVer component instead.
-- If the user gives an explicit version such as `0.8.0` or `v0.8.0`, use it after stripping a leading `v`.
-- Reject non-SemVer versions. Use `MAJOR.MINOR.PATCH`.
+- Default to `patch`.
+- Use `minor` or `major` when the user asks for that release type.
+- Use an explicit SemVer version when the user gives a target such as `0.9.0`
+  or `v0.9.0`.
 
 ## Preconditions
 
 1. Work from the repository root.
-2. Check branch and cleanliness:
+2. Check local state:
    ```bash
    git status --short --branch
-   ```
-3. Require the active branch to be `main` tracking `origin/main`.
-4. If there are uncommitted changes unrelated to the release bump, stop and ask.
-5. Fetch tags and refs:
-   ```bash
    git fetch origin --prune --tags
    ```
-6. Confirm the target tag does not already exist locally or remotely:
+3. Require local `main` to track `origin/main`.
+4. If local `main` is behind `origin/main`, pull or ask before continuing.
+5. If local `main` is ahead of `origin/main`, confirm those commits are intended
+   to be released before pushing.
+6. If there are unrelated uncommitted changes, stop and ask unless the user
+   explicitly wants them included in the release commit.
+7. Read current versions:
    ```bash
-   git tag --list vX.Y.Z
-   git ls-remote --tags origin vX.Y.Z
+   rg -n '"version"|^version =|name = "ha-aiper"' custom_components/aiper/manifest.json pyproject.toml uv.lock
+   ```
+8. Require the existing versions in `custom_components/aiper/manifest.json`,
+   `pyproject.toml`, and the `ha-aiper` stanza in `uv.lock` to match before
+   bumping. If they differ, stop and fix that mismatch first.
+
+## Bump Version
+
+1. Determine the target version from the current version:
+   - patch: increment `PATCH`
+   - minor: increment `MINOR` and reset `PATCH` to `0`
+   - major: increment `MAJOR` and reset `MINOR` and `PATCH` to `0`
+2. Update all stored package versions:
+   - `custom_components/aiper/manifest.json`: top-level `"version"`
+   - `pyproject.toml`: `[project]` `version`
+   - `uv.lock`: only the `version` in the `[[package]]` stanza where
+     `name = "ha-aiper"`
+3. Prefer `uv lock` after editing `pyproject.toml` so `uv.lock` stays
+   mechanically consistent.
+4. Confirm the new version is greater than the latest SemVer tag:
+   ```bash
+   git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=v:refname | tail -1
    ```
 
-## Determine Version
+## Validate Locally
 
-Read both version sources:
-
-- `custom_components/aiper/manifest.json` field: `version`
-- `pyproject.toml` field: `[project].version`
-
-Use the manifest version as the authoritative current release version unless the
-user explicitly instructs otherwise. `pyproject.toml` is development metadata in
-this repo, but keep it synchronized with the release version because the user has
-requested both files be updated during release.
-
-Compute the new version:
-
-- patch: `X.Y.Z -> X.Y.(Z+1)`
-- minor: `X.Y.Z -> X.(Y+1).0`
-- major: `X.Y.Z -> (X+1).0.0`
-
-The Git tag must be `vX.Y.Z`; the files must contain `X.Y.Z` without `v`.
-
-## Edit Versions
-
-Update only:
-
-- `custom_components/aiper/manifest.json`
-- `pyproject.toml`
-
-Prefer `apply_patch` for simple edits. Preserve existing formatting.
-
-After editing, verify:
+Run the local checks before committing:
 
 ```bash
-rg -n '"version"|^version =' custom_components/aiper/manifest.json pyproject.toml
+uv sync --locked --group dev
+uv run --frozen ruff check custom_components/
+uv run --frozen mypy custom_components/
+uv run --frozen pytest
 ```
 
-## Validate Before Tagging
-
-Run the normal local validation before creating the tag:
-
-```bash
-uv run ruff check custom_components/aiper tools tests
-uv run pyright
-uv run pytest
-python -m compileall custom_components/aiper tools tests
-```
-
-If any validation fails, fix it before committing.
+If a check fails, fix it or report the blocker. Do not commit a release version
+that has not passed local validation unless the user explicitly instructs that.
 
 ## Commit And Push
 
-Commit only the version bump:
+Commit only the intended release files and push `main`:
 
 ```bash
-git add custom_components/aiper/manifest.json pyproject.toml
+git diff -- custom_components/aiper/manifest.json pyproject.toml uv.lock
+git add custom_components/aiper/manifest.json pyproject.toml uv.lock
 git commit -m "Release X.Y.Z"
 git push origin main
 ```
 
-Wait for the `main` push Validation workflow to complete before creating or
-pushing the release tag. This prevents the tag-triggered Release workflow from
-publishing an artifact before the commit has passed validation.
+The push triggers `.github/workflows/ci-cd.yaml`. The release job will only run
+when the quality job succeeds and the version does not already have a matching
+tag.
 
-Find and watch the validation run for the release commit:
+## Follow CI/CD
+
+Find the new run and watch it:
 
 ```bash
-git rev-parse HEAD
-gh run list -R filmackay/ha-aiper --workflow Validation --branch main --limit 10 --json databaseId,headSha,status,conclusion,url
+gh run list -R filmackay/ha-aiper --workflow "CI/CD" --branch main --limit 10 --json databaseId,displayTitle,headSha,status,conclusion,createdAt,url
 gh run watch -R filmackay/ha-aiper RUN_ID --exit-status
 ```
 
-If Validation fails, do not tag. Inspect logs, fix the issue, amend or create a
-new release commit as appropriate, push `main`, and wait for Validation again.
-
-Create and push an annotated tag:
+If it fails, inspect logs:
 
 ```bash
-git tag -a vX.Y.Z -m "vX.Y.Z"
-git push origin vX.Y.Z
+gh run view -R filmackay/ha-aiper RUN_ID --log-failed
 ```
 
-Do not force-push a release tag. If a tag was created incorrectly but not pushed,
-delete it locally and recreate it. If it was pushed, stop and ask.
+## Verify Release
 
-## Follow Release Action
+After success:
 
-The release workflow is `.github/workflows/release.yaml` and triggers on tags
-matching `v*`. After pushing the tag:
-
-1. Find the Release workflow run:
+1. Fetch refs:
    ```bash
-   gh run list --workflow Release --limit 10 --json databaseId,displayTitle,headBranch,headSha,status,conclusion,createdAt,url
+   git fetch origin --prune --tags
+   git status --short --branch
+   git log --oneline --decorate -5
    ```
-2. Watch it:
+2. Verify the tag points at the release commit.
+3. Verify GitHub release and `aiper.zip`:
    ```bash
-   gh run watch RUN_ID --exit-status
-   ```
-3. If it fails, inspect logs:
-   ```bash
-   gh run view RUN_ID --log-failed
-   ```
-4. If it succeeds, verify the GitHub release and `aiper.zip` asset:
-   ```bash
-   gh release view vX.Y.Z --json tagName,name,url,assets
+   gh release view -R filmackay/ha-aiper vX.Y.Z --json tagName,name,url,assets
    ```
 
 ## Final Response
@@ -144,7 +123,8 @@ matching `v*`. After pushing the tag:
 Report:
 
 - released version and tag
-- commit SHA
-- release workflow result
+- release commit SHA
+- CI/CD workflow result and URL
 - GitHub release URL
-- any warnings or follow-up issues
+- asset name/size
+- warnings or follow-up issues

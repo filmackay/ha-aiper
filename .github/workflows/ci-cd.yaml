@@ -1,4 +1,4 @@
-name: Validation
+name: CI/CD
 
 on:
   push:
@@ -7,27 +7,42 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
-concurrency:
-  group: validation-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  validate:
-    name: Validate
+  quality:
+    name: Quality
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Run hassfest
+      - name: UV Install
+        id: setup-uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: UV Dependencies
+        id: sync-uv
+        run: uv sync --locked --group dev
+
+      - name: Hassfest
         id: hassfest
         uses: home-assistant/actions/hassfest@master
         continue-on-error: true
 
-      - name: Run HACS validation
+      - name: HACS validation
         id: hacs
         uses: hacs/action@main
         with:
@@ -35,24 +50,12 @@ jobs:
           ignore: brands
         continue-on-error: true
 
-      - name: Install uv
-        id: setup-uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          python-version: "3.14"
-
-      - name: Install dependencies
-        id: sync
-        run: uv sync --locked --group dev
-        continue-on-error: true
-
-      - name: Run Ruff
+      - name: Ruff
         id: ruff
         run: uv run --frozen ruff check custom_components/
         continue-on-error: true
 
-      - name: Run mypy
+      - name: Mypy
         id: mypy
         run: uv run --frozen mypy custom_components/
         continue-on-error: true
@@ -83,9 +86,29 @@ jobs:
           check_step "hassfest" "${{ steps.hassfest.outcome }}"
           check_step "HACS validation" "${{ steps.hacs.outcome }}"
           check_step "uv setup" "${{ steps.setup-uv.outcome }}"
-          check_step "dependency sync" "${{ steps.sync.outcome }}"
+          check_step "uv dependencies" "${{ steps.sync-uv.outcome }}"
           check_step "Ruff" "${{ steps.ruff.outcome }}"
           check_step "mypy" "${{ steps.mypy.outcome }}"
           check_step "pytest" "${{ steps.pytest.outcome }}"
 
           exit "$failed"
+
+      - name: Version
+        id: version
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: uv run --frozen .github/scripts/check_version_state.py
+
+      - name: Create release
+        if: ${{ steps.version.outputs.release_needed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          zip -r aiper.zip custom_components/aiper
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "${tag}"
+          git push origin "${tag}"
+          gh release create "${tag}" aiper.zip \
+            --title "${tag}" \
+            --notes "Release ${tag}"
