@@ -28,6 +28,7 @@ from .const import (
     MODE_MAP,
     CLEAN_PATH_MAP,
 )
+from .controller import AiperDeviceController
 from .coordinator import AiperDataUpdateCoordinator
 from .profiles import Capability, has_capability
 
@@ -91,7 +92,7 @@ def _supports_clean_path(dev: dict[str, Any]) -> bool:
 
 def _supports_mode_control(dev: dict[str, Any]) -> bool:
     """Return whether mode control has enough evidence to be exposed."""
-    return has_capability(dev, Capability.MODE_SELECT)
+    return has_capability(dev, Capability.CLEANING_MODE_SELECT)
 
 
 class AiperSelectBase(CoordinatorEntity[AiperDataUpdateCoordinator], SelectEntity):
@@ -103,6 +104,7 @@ class AiperSelectBase(CoordinatorEntity[AiperDataUpdateCoordinator], SelectEntit
     def __init__(
         self,
         coordinator: AiperDataUpdateCoordinator,
+        controller: AiperDeviceController,
         entry: ConfigEntry,
         sn: str,
         key: str,
@@ -113,6 +115,7 @@ class AiperSelectBase(CoordinatorEntity[AiperDataUpdateCoordinator], SelectEntit
         enabled_default: bool = True,
     ) -> None:
         super().__init__(coordinator)
+        self.controller = controller
         self._config_entry = entry
         self._sn = sn
         self._key = key
@@ -205,6 +208,7 @@ class AiperCleaningModeSelect(AiperSelectBase):
     def __init__(
         self,
         coordinator: AiperDataUpdateCoordinator,
+        controller: AiperDeviceController,
         entry: ConfigEntry,
         sn: str,
         name: str,
@@ -215,6 +219,7 @@ class AiperCleaningModeSelect(AiperSelectBase):
         # MQTT is required to change the mode.
         super().__init__(
             coordinator,
+            controller,
             entry,
             sn,
             "mode_selection",
@@ -285,41 +290,37 @@ class AiperCleaningModeSelect(AiperSelectBase):
         if cur is not None and cur == mode_id:
             return
 
-        self.coordinator.note_command_sent(self._sn, "mode", mode_id)
-
-        ok = False
-        try:
-            ok = await self.hass.async_add_executor_job(self.coordinator.api.set_mode, self._sn, mode_id)
-        except Exception as err:
-            self.coordinator.note_command_failed(self._sn, "mode", mode_id, reason=str(err))
-            raise HomeAssistantError(f"Failed to set cleaning mode: {err}") from err
-        if not ok:
-            self.coordinator.note_command_failed(self._sn, "mode", mode_id, reason="device rejected")
+        result = await self.controller.set_cleaning_mode(self._sn, mode_id)
+        if not result.ok:
             if not self.coordinator.api.is_mqtt_connected():
                 raise HomeAssistantError(
                     "Failed to set cleaning mode: MQTT is not connected. Enable MQTT in the Aiper integration options."
                 )
-            raise HomeAssistantError("Failed to set cleaning mode: device rejected the command")
+            raise HomeAssistantError(f"Failed to set cleaning mode: {result.reason or 'device rejected the command'}")
 
         # Ask for a shadow refresh and a coordinator refresh.
         try:
-            await self.hass.async_add_executor_job(self.coordinator.api.request_shadow, self._sn)
+            await self.controller.refresh_shadow(self._sn)
         except Exception:
             pass
 
         await self.coordinator.async_request_refresh()
+
+
 class AiperCleanPathSelect(AiperSelectBase):
     """Select for choosing cleaning path."""
 
     def __init__(
         self,
         coordinator: AiperDataUpdateCoordinator,
+        controller: AiperDeviceController,
         entry: ConfigEntry,
         sn: str,
         name: str,
     ) -> None:
         super().__init__(
             coordinator,
+            controller,
             entry,
             sn,
             "clean_path",
@@ -354,7 +355,7 @@ class AiperCleanPathSelect(AiperSelectBase):
         return label
 
     @property
-    def extra_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         attrs = dict(super().extra_state_attributes)
         try:
             shadow = getattr(self.coordinator, "_shadow_data", {}).get(self._sn) or {}
@@ -367,7 +368,6 @@ class AiperCleanPathSelect(AiperSelectBase):
             pass
         return attrs
 
-
     async def async_select_option(self, option: str) -> None:
         self._raise_if_control_blocked()
 
@@ -379,9 +379,9 @@ class AiperCleanPathSelect(AiperSelectBase):
                 break
 
         # Allow unexpected IDs that we surfaced as dynamic options (e.g. 'Path 2').
-        if path_id is None and isinstance(option, str) and option.lower().startswith('path '):
+        if path_id is None and isinstance(option, str) and option.lower().startswith("path "):
             try:
-                path_id = int(option.split(' ', 1)[1].strip())
+                path_id = int(option.split(" ", 1)[1].strip())
             except Exception:
                 path_id = None
 
@@ -392,27 +392,13 @@ class AiperCleanPathSelect(AiperSelectBase):
         if cur is not None and int(cur) == path_id:
             return
 
-        self.coordinator.note_command_sent(self._sn, "clean_path", path_id)
-
-        ok = False
-        try:
-            ok = await self.hass.async_add_executor_job(
-                self.coordinator.api.update_clean_path_setting,
-                self._sn,
-                path_id,
-            )
-        except Exception as err:
-            self.coordinator.note_command_failed(self._sn, "clean_path", path_id, reason=str(err))
-            raise HomeAssistantError(f"Failed to set clean path: {err}") from err
-        if not ok:
-            self.coordinator.note_command_failed(self._sn, "clean_path", path_id, reason="device rejected")
+        result = await self.controller.set_clean_path(self._sn, path_id)
+        if not result.ok:
             if not self.coordinator.api.is_mqtt_connected():
                 raise HomeAssistantError(
                     "Failed to set clean path: cloud control is unavailable because MQTT is not connected. Enable MQTT in the Aiper integration options."
                 )
-            raise HomeAssistantError("Failed to set clean path: device rejected the command")
-
-
+            raise HomeAssistantError(f"Failed to set clean path: {result.reason or 'device rejected the command'}")
 
         # Optimistically cache the selection. Some firmwares never report cleanPath
         # in reported shadow state, so without this the entity can remain Unknown.
@@ -423,16 +409,19 @@ class AiperCleanPathSelect(AiperSelectBase):
 
         # Ask for a shadow refresh and a coordinator refresh.
         try:
-            await self.hass.async_add_executor_job(self.coordinator.api.request_shadow, self._sn)
+            await self.controller.refresh_shadow(self._sn)
         except Exception:
             pass
 
         await self.coordinator.async_request_refresh()
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
     """Set up select entities from a config entry."""
     coordinator: AiperDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    controller: AiperDeviceController = hass.data[DOMAIN][entry.entry_id]["controller"]
 
-    # Determine if MQTT is enabled (controls the default enabled-state for mode select).
+    # Determine if MQTT is enabled for cleaning-mode command availability.
     mqtt_enabled = bool(entry.options.get(CONF_ENABLE_MQTT)) if CONF_ENABLE_MQTT in entry.options else True
 
     entities: list[SelectEntity] = []
@@ -448,8 +437,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 mode_map = {mode_id: MODE_MAP.get(mode_id, f"Mode {mode_id}") for mode_id in supported}
 
             if _supports_clean_path(dev):
-                entities.append(AiperCleanPathSelect(coordinator, entry, sn, name))
+                entities.append(AiperCleanPathSelect(coordinator, controller, entry, sn, name))
             if _supports_mode_control(dev):
-                entities.append(AiperCleaningModeSelect(coordinator, entry, sn, name, supported, mode_map, mqtt_enabled))
+                entities.append(
+                    AiperCleaningModeSelect(coordinator, controller, entry, sn, name, supported, mode_map, mqtt_enabled)
+                )
 
     async_add_entities(entities)

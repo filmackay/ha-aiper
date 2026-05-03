@@ -5,11 +5,11 @@ from __future__ import annotations
 from custom_components.aiper.select import _supports_clean_path, _supports_mode_control
 
 
-def test_surfer_s2_does_not_get_scuba_only_controls() -> None:
-    """Surfer S2 should not inherit Scuba controls from generic fallbacks."""
+def test_surfer_s2_does_not_expose_select_controls() -> None:
+    """Surfer S2 exposes on/off run control through switch, not selects."""
     dev = {
         "deviceModel": "Surfer_S2",
-        "_ha_capabilities": ["battery", "history", "online"],
+        "_ha_capabilities": ["battery", "history", "online", "run_control"],
         "_ha_supported_mode_ids": [1, 2, 3, 4, 5],
         "_ha_supported_modes_explicit": False,
     }
@@ -18,10 +18,10 @@ def test_surfer_s2_does_not_get_scuba_only_controls() -> None:
     assert _supports_mode_control(dev) is False
 
 
-def test_explicit_mode_capabilities_allow_mode_control() -> None:
-    """Non-Scuba models can expose mode control when payloads prove support."""
+def test_mode_capability_allows_mode_control() -> None:
+    """The select helper follows the normalized profile capability."""
     dev = {
-        "deviceModel": "Surfer_S2",
+        "deviceModel": "Shark_X",
         "_ha_capabilities": ["mode_select"],
         "_ha_supported_mode_ids": [1, 5],
         "_ha_supported_modes_explicit": True,

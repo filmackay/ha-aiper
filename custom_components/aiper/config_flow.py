@@ -10,6 +10,7 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AiperApi
 from .const import (
@@ -47,21 +48,22 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         username=data[CONF_USERNAME],
         password=data[CONF_PASSWORD],
         region=data[CONF_REGION],
+        async_session=async_get_clientsession(hass),
     )
 
     try:
-        result = await hass.async_add_executor_job(api.login)
+        result = await api.login()
         if not result:
             raise InvalidAuth
 
         # Get devices to show count
-        devices = await hass.async_add_executor_job(api.get_devices)
+        devices = await api.get_devices()
 
     except Exception as err:
         _LOGGER.error("Login validation failed: %s", err)
         raise InvalidAuth from err
     finally:
-        await hass.async_add_executor_job(api.disconnect)
+        await api.disconnect()
 
     return {
         "title": f"Aiper ({data[CONF_USERNAME]})",

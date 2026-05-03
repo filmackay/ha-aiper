@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from custom_components.aiper.api import AiperApi
 from custom_components.aiper.const import TOPIC_READ, TOPIC_SHADOW_GET_REQUEST, TOPIC_SHADOW_UPDATE, TOPIC_WRITE
 
@@ -19,15 +21,15 @@ class FakeMqttTransport:
     def is_connected(self) -> bool:
         return True
 
-    def subscribe(self, topic: str, callback, qos: int = 1) -> bool:
+    async def async_subscribe(self, topic: str, callback, qos: int = 1) -> bool:
         self.subscriptions[topic] = callback
         return True
 
-    def publish(self, topic: str, payload: str | bytes, qos: int = 1) -> bool:
+    async def async_publish(self, topic: str, payload: str | bytes, qos: int = 1) -> bool:
         self.published.append((topic, payload, qos))
         return True
 
-    def disconnect(self) -> None:
+    async def async_disconnect(self) -> None:
         return None
 
 
@@ -39,12 +41,13 @@ def _api_with_fake_mqtt() -> tuple[AiperApi, FakeMqttTransport]:
     return api, transport
 
 
-def test_subscribe_device_normalizes_transport_messages() -> None:
+@pytest.mark.asyncio
+async def test_subscribe_device_normalizes_transport_messages() -> None:
     """MQTT callbacks should preserve SN/topic metadata and ack handling."""
     api, transport = _api_with_fake_mqtt()
     events: list[tuple[str, dict[str, Any]]] = []
 
-    assert api.subscribe_device("SN123", lambda sn, payload: events.append((sn, payload))) is True
+    assert await api.subscribe_device("SN123", lambda sn, payload: events.append((sn, payload))) is True
 
     topic = TOPIC_READ.format(sn="SN123")
     message = {
@@ -73,15 +76,16 @@ def test_subscribe_device_normalizes_transport_messages() -> None:
         )
     ]
     assert api._timezone_string_for_sn("SN123") == "UTC+10"
-    assert api._wait_for_ack("SN123", timeout=0.01) == "+OK\r\n"
+    assert await api._wait_for_ack("SN123", timeout=0.01) == "+OK\r\n"
 
 
-def test_shadow_publish_uses_transport() -> None:
+@pytest.mark.asyncio
+async def test_shadow_publish_uses_transport() -> None:
     """Shadow request/update helpers should publish through the transport wrapper."""
     api, transport = _api_with_fake_mqtt()
 
-    assert api.request_shadow("SN123") is True
-    assert api.publish_shadow_desired("SN123", {"Machine": {"status": 1}}) is True
+    assert await api.request_shadow("SN123") is True
+    assert await api.publish_shadow_desired("SN123", {"Machine": {"status": 1}}) is True
 
     assert transport.published[0] == (TOPIC_SHADOW_GET_REQUEST.format(sn="SN123"), "", 1)
     assert transport.published[1] == (
@@ -91,14 +95,32 @@ def test_shadow_publish_uses_transport() -> None:
     )
 
 
-def test_downchan_command_publishes_plain_and_encrypted_payloads() -> None:
-    """Command publishing should keep the compatibility dual-publish behavior."""
+@pytest.mark.asyncio
+async def test_downchan_command_publishes_plain_payload() -> None:
+    """Command publishing should use the plain JSON payload accepted by current firmware."""
     api, transport = _api_with_fake_mqtt()
 
-    assert api.send_command("SN123", "Machine", {"status": 1}) is True
+    assert await api.send_command("SN123", "Machine", {"status": 1}) is True
 
-    assert len(transport.published) == 2
+    assert len(transport.published) == 1
     assert transport.published[0][0] == TOPIC_WRITE.format(sn="SN123")
-    assert transport.published[1][0] == TOPIC_WRITE.format(sn="SN123")
     assert '"status":1' in str(transport.published[0][1])
-    assert transport.published[0][1] != transport.published[1][1]
+
+
+@pytest.mark.asyncio
+async def test_mqtt_paths_use_transport() -> None:
+    """Shadow and command helpers should use async transport methods."""
+    api, transport = _api_with_fake_mqtt()
+
+    assert await api.request_shadow("SN123") is True
+    assert await api.publish_shadow_desired("SN123", {"Machine": {"status": 1}}) is True
+    assert await api.send_command("SN123", "Machine", {"status": 1}) is True
+
+    assert transport.published[0] == (TOPIC_SHADOW_GET_REQUEST.format(sn="SN123"), "", 1)
+    assert transport.published[1] == (
+        TOPIC_SHADOW_UPDATE.format(sn="SN123"),
+        '{"state":{"desired":{"Machine":{"status":1}}}}',
+        1,
+    )
+    assert transport.published[2][0] == TOPIC_WRITE.format(sn="SN123")
+    assert '"status":1' in str(transport.published[2][1])

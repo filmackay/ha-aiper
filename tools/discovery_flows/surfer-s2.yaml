@@ -1,5 +1,5 @@
 name: Surfer S2
-description: Guided discovery flow for Surfer S2 support work.
+description: Guided app-action capture for Surfer S2 support work.
 steps:
   - id: baseline_idle
     prompt: Make sure the Surfer S2 is online, in water if practical, and idle.
@@ -26,7 +26,7 @@ steps:
       shadow: true
       observe_seconds: 60
   - id: solar_or_basket_state
-    prompt: If practical, trigger or inspect solar/charging/basket state in the app; otherwise just continue.
+    prompt: If practical, trigger or inspect solar, charging, or basket state in the app; otherwise just continue.
     capture:
       rest: true
       shadow: true

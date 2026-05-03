@@ -118,6 +118,13 @@ uv run tools/aiper_probe.py guided --profile surfer-s2 --sn T1B50900024
 
 Available flows live in `tools/discovery_flows/`.
 
+Run the contract verifier when checking current REST bodies and legacy control
+fallbacks:
+
+```bash
+uv run tools/aiper_probe.py contract-verify --sn T1B50900024 --allow-control
+```
+
 ### Command Behavior
 
 `list` logs in and prints the discovered devices as redacted JSON. Use it first
@@ -144,6 +151,11 @@ shadow request.
 
 `at` sends exactly one AT command through `AiperApi.send_machine_at`. It requires
 `--allow-control` because AT commands can affect a real device.
+
+`contract-verify` runs targeted REST and MQTT command probes. It is intended for
+specific protocol questions such as history body shape, consumables body shape,
+clean-path endpoint behavior, and legacy AT fallback behavior. It requires
+`--allow-control` because it sends commands to the device.
 
 `guided` loads a YAML flow from `tools/discovery_flows/`, prompts the user for
 each step, and captures REST/shadow/MQTT evidence around the official app action
@@ -216,35 +228,38 @@ Keep flows focused on repeatable observations. They should ask the user to
 perform actions in the official Aiper app; they should not encode protocol
 guesses.
 
-## Surfer S2 Support Workflow
+## Discovery Workflow
 
 1. Run `snapshot` for the device.
-2. Run `guided --profile surfer-s2`.
-3. During guided steps, use the official Aiper app to start, stop, and change
-   Surfer S2 settings.
-4. Add sanitized output as fixtures under `tests/fixtures/surfer_s2/`.
-5. Implement parser/capability changes from fixture evidence.
+2. Run targeted probes for known protocol questions:
+   `history`, `consumables`, `at-format`, or `contract-verify`.
+3. Run `guided --profile generic` or a more specific app-action flow
+   when the missing evidence depends on official app workflows.
+4. During guided steps, use the official Aiper app to perform the requested
+   action while the probe captures REST/shadow/MQTT evidence.
+5. Add sanitized output as fixtures under `tests/fixtures/<model_family>/`.
+6. Implement parser/capability changes from fixture evidence.
 
-Do not guess movement/control commands from Scuba X1 behavior. Capture official
-app behavior first, then encode Surfer S2 support in the integration.
+Do not guess movement/control commands from a different device family. Capture
+official app behavior first, then encode support in the integration.
 
 ## Turning Probe Output Into Support
 
-After collecting Surfer S2 data:
+After collecting device data:
 
 1. Review the output and remove anything irrelevant or unexpectedly sensitive.
 2. Keep serial numbers if they help correlate topic names and payloads.
-3. Add representative payloads as fixtures under `tests/fixtures/surfer_s2/`.
+3. Add representative payloads as fixtures under `tests/fixtures/<model_family>/`.
 4. Add parser tests before changing entity behavior.
 5. Add or update model-family/capability logic in the integration.
-6. Gate Scuba-only controls away from Surfer S2 unless the probe evidence proves
-   they apply.
+6. Gate family-specific controls away from other families unless probe evidence
+   proves they apply.
 7. Add command support only after official app traces show the correct command
    shape and reported-state response.
 
 Useful questions to answer from the evidence:
 
-- Which payload field identifies Surfer S2 reliably?
+- Which payload field identifies the model family reliably?
 - Which topics does it publish to?
 - Which component carries online, battery, status, warnings, and run time?
 - Does it report modes as numeric IDs, strings, or another structure?

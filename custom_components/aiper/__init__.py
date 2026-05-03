@@ -6,12 +6,14 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_registry import RegistryEntryDisabler
 
 from .const import DOMAIN, CONF_ENABLE_MQTT, CONF_MQTT_DEBUG, CONF_POLL_INTERVAL, DEFAULT_SCAN_INTERVAL, CONF_HISTORY_REFRESH_HOURS, CONF_CONSUMABLES_REFRESH_HOURS, CONF_CLEAN_PATH_REFRESH_HOURS, DEFAULT_HISTORY_REFRESH_HOURS, DEFAULT_CONSUMABLES_REFRESH_HOURS, DEFAULT_CLEAN_PATH_REFRESH_HOURS
+from .controller import AiperDeviceController
 from .coordinator import AiperDataUpdateCoordinator
 from .api import AiperApi
 
@@ -21,73 +23,13 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
     Platform.SELECT,
+    Platform.SWITCH,
 ]
-
-SERVICE_SEND_AT = "send_at_command"
-
-
-def _async_find_service_target(
-    hass: HomeAssistant,
-    sn: str | None,
-) -> tuple[AiperApi, AiperDataUpdateCoordinator, str] | None:
-    """Find the API/coordinator/device serial number for a service call."""
-    entries: dict[str, dict[str, Any]] = hass.data.get(DOMAIN, {})
-
-    if sn:
-        for data in entries.values():
-            coordinator: AiperDataUpdateCoordinator | None = data.get("coordinator")
-            if coordinator and coordinator.data and sn in coordinator.data:
-                return data["api"], coordinator, sn
-        return None
-
-    for data in entries.values():
-        coordinator = data.get("coordinator")
-        if coordinator and coordinator.data:
-            first_sn = next(iter(coordinator.data.keys()), None)
-            if first_sn:
-                return data["api"], coordinator, first_sn
-
-    return None
-
-
-async def _async_send_at_command_service(hass: HomeAssistant, call: ServiceCall) -> None:
-    """Send a raw AT command to a discovered Aiper device."""
-    sn = call.data.get("sn")
-    sn = str(sn).strip() if sn else None
-
-    target = _async_find_service_target(hass, sn)
-    if target is None:
-        if sn:
-            _LOGGER.warning("send_at_command called for unknown Aiper device SN: %s", sn)
-        else:
-            _LOGGER.warning("send_at_command called but no Aiper device SN is available")
-        return
-
-    api, _coordinator, resolved_sn = target
-
-    cmd = str(call.data.get("command", "")).strip()
-    if not cmd:
-        _LOGGER.warning("send_at_command called with empty command")
-        return
-
-    if not cmd.upper().startswith("AT+"):
-        cmd = "AT+" + cmd
-
-    await hass.async_add_executor_job(api.send_machine_at, resolved_sn, cmd)
-    await hass.async_add_executor_job(api.request_shadow, resolved_sn)
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up the Aiper integration."""
     hass.data.setdefault(DOMAIN, {})
-
-    if not hass.services.has_service(DOMAIN, SERVICE_SEND_AT):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SEND_AT,
-            lambda call: _async_send_at_command_service(hass, call),
-        )
-
     return True
 
 
@@ -151,7 +93,7 @@ async def _cleanup_legacy_entities(
     """Remove legacy entities that are no longer provided.
 
     Earlier test builds exposed entities that are now intentionally removed:
-    - An on/off switch (no functional value for Scuba X1)
+    - Legacy switch/vacuum controls from before model-specific run support
     - A duplicate "cleaning mode" sensor (superseded by the select)
 
     Home Assistant keeps orphaned entities in the entity registry, so we
@@ -160,9 +102,11 @@ async def _cleanup_legacy_entities(
     ent_reg = er.async_get(hass)
     entries = er.async_entries_for_config_entry(ent_reg, entry.entry_id)
 
-    # Remove any switch/vacuum entities from earlier builds.
+    # Remove switch/vacuum entities from earlier builds while preserving the
+    # verified model-specific run switch.
     for ent in entries:
-        if ent.domain in ("switch", "vacuum"):
+        uid = ent.unique_id or ""
+        if ent.domain == "vacuum" or (ent.domain == "switch" and not uid.endswith("_run")):
             _LOGGER.info("Removing legacy Aiper %s entity: %s", ent.domain, ent.entity_id)
             ent_reg.async_remove(ent.entity_id)
 
@@ -390,11 +334,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         username=entry.data["username"],
         password=entry.data["password"],
         region=entry.data.get("region", "eu"),
+        async_session=async_get_clientsession(hass),
     )
 
     try:
         _LOGGER.debug("Attempting login to Aiper API...")
-        await hass.async_add_executor_job(api.login)
+        await api.login()
         _LOGGER.info("Login successful")
     except Exception as err:
         _LOGGER.error("Failed to login to Aiper: %s", err)
@@ -410,6 +355,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         consumables_refresh_hours=entry.options.get(CONF_CONSUMABLES_REFRESH_HOURS, DEFAULT_CONSUMABLES_REFRESH_HOURS),
         clean_path_refresh_hours=entry.options.get(CONF_CLEAN_PATH_REFRESH_HOURS, DEFAULT_CLEAN_PATH_REFRESH_HOURS),
         push_primary=enable_mqtt,
+        config_entry=entry,
     )
     
     _LOGGER.debug("Performing first data refresh...")
@@ -434,6 +380,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
+        "controller": AiperDeviceController(api, coordinator),
         "coordinator": coordinator,
         "_unsub_keepalive": unsub_keepalive,
     }
@@ -457,16 +404,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("MQTT debug logging is enabled; raw topics/payloads will be logged at DEBUG")
 
         try:
-            connected = await hass.async_add_executor_job(api.connect_mqtt)
+            connected = await api.connect_mqtt()
             if connected and coordinator.data:
                 coordinator.set_push_primary(True)
                 for sn in coordinator.data.keys():
                     # AWS IoT callbacks arrive on a background thread.
                     # Ensure coordinator updates happen on the HA event loop.
                     cb = coordinator.make_shadow_callback(sn)
-                    await hass.async_add_executor_job(api.subscribe_device, sn, cb)
+                    await api.subscribe_device(sn, cb)
                     # Ask for a current shadow snapshot; many stacks publish only on change.
-                    await hass.async_add_executor_job(api.request_shadow, sn)
+                    await api.request_shadow(sn)
                 _LOGGER.info("MQTT connected and subscriptions registered")
             else:
                 coordinator.set_push_primary(False)
@@ -491,6 +438,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception:
                 pass
         api: AiperApi = data["api"]
-        await hass.async_add_executor_job(api.disconnect)
+        await api.disconnect()
 
     return unload_ok

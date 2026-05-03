@@ -1,5 +1,5 @@
 name: Generic Aiper
-description: Minimal guided discovery flow for any Aiper device.
+description: Minimal guided app-action capture for any Aiper device.
 steps:
   - id: baseline_idle
     prompt: Make sure the device is online and idle.

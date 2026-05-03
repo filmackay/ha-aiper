@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from .const import MODE_MAP, SCUBA_MODEL_MARKERS
+from .const import MODE_MAP, ModelMarker
 
 
 class DeviceFamily(StrEnum):
@@ -28,7 +28,8 @@ class Capability(StrEnum):
     HISTORY = "history"
     FIRMWARE = "firmware"
     MQTT_SHADOW = "mqtt_shadow"
-    MODE_SELECT = "mode_select"
+    CLEANING_MODE_SELECT = "mode_select"
+    RUN_CONTROL = "run_control"
     CLEAN_PATH = "clean_path"
     WATER_TEMPERATURE = "water_temperature"
     IN_WATER = "in_water"
@@ -41,8 +42,8 @@ class Capability(StrEnum):
     PROPELLER_MAINTENANCE = "propeller_maintenance"
 
 
-SURFER_MODEL_MARKERS = ("surfer",)
-SHARK_MODEL_MARKERS = ("shark",)
+SURFER_MODEL_MARKERS = (ModelMarker.SURFER.value,)
+SHARK_MODEL_MARKERS = (ModelMarker.SHARK.value,)
 
 COMMON_CAPABILITIES = frozenset(
     {
@@ -61,7 +62,7 @@ COMMON_CAPABILITIES = frozenset(
 
 SCUBA_CAPABILITIES = COMMON_CAPABILITIES | frozenset(
     {
-        Capability.MODE_SELECT,
+        Capability.CLEANING_MODE_SELECT,
         Capability.CLEAN_PATH,
         Capability.WATER_TEMPERATURE,
         Capability.IN_WATER,
@@ -73,6 +74,7 @@ SCUBA_CAPABILITIES = COMMON_CAPABILITIES | frozenset(
 
 SURFER_CAPABILITIES = COMMON_CAPABILITIES | frozenset(
     {
+        Capability.RUN_CONTROL,
         Capability.PROPELLER_MAINTENANCE,
         Capability.SOLAR_CHARGING,
     }
@@ -104,7 +106,7 @@ def device_model_string(device: dict[str, Any]) -> str:
 def device_family(device: dict[str, Any]) -> DeviceFamily:
     """Infer the broad device family from model payload fields."""
     model = device_model_string(device).lower()
-    if any(marker in model for marker in SCUBA_MODEL_MARKERS):
+    if ModelMarker.SCUBA.value in model:
         return DeviceFamily.SCUBA
     if any(marker in model for marker in SURFER_MODEL_MARKERS):
         return DeviceFamily.SURFER
@@ -116,6 +118,9 @@ def device_family(device: dict[str, Any]) -> DeviceFamily:
 def _mode_map_for_ids(family: DeviceFamily, mode_ids: list[int]) -> dict[int, str]:
     if family == DeviceFamily.SCUBA:
         return {mode_id: MODE_MAP.get(mode_id, f"Mode {mode_id}") for mode_id in mode_ids}
+    if family == DeviceFamily.SURFER:
+        mode_map = {0: "Off", 1: "Manual", 5: "Scheduled"}
+        return {mode_id: mode_map.get(mode_id, f"Mode {mode_id}") for mode_id in sorted({0, *mode_ids})}
     return {mode_id: f"Mode {mode_id}" for mode_id in mode_ids}
 
 
@@ -137,17 +142,19 @@ def _has_consumable(device: dict[str, Any], *terms: str) -> bool:
 def derive_device_profile(device: dict[str, Any]) -> DeviceProfile:
     """Derive a device profile from identity fields and discovered payload evidence."""
     family = device_family(device)
+    supported = device.get("_ha_supported_mode_ids")
+    mode_ids = [int(mode_id) for mode_id in supported] if isinstance(supported, list) else []
+
     if family == DeviceFamily.SCUBA:
         capabilities = set(SCUBA_CAPABILITIES)
     elif family == DeviceFamily.SURFER:
         capabilities = set(SURFER_CAPABILITIES)
     elif family == DeviceFamily.SHARK:
         capabilities = set(SHARK_CAPABILITIES)
+        if bool(device.get("_ha_supported_modes_explicit")) and mode_ids:
+            capabilities.add(Capability.CLEANING_MODE_SELECT)
     else:
         capabilities = set(COMMON_CAPABILITIES)
-
-    if bool(device.get("_ha_supported_modes_explicit")):
-        capabilities.add(Capability.MODE_SELECT)
 
     shadow = device.get("shadow") or {}
     machine = shadow.get("machine") or {}
@@ -168,8 +175,6 @@ def derive_device_profile(device: dict[str, Any]) -> DeviceProfile:
     if _has_consumable(device, "caterpillar"):
         capabilities.add(Capability.CATERPILLAR_TREAD)
 
-    supported = device.get("_ha_supported_mode_ids")
-    mode_ids = [int(mode_id) for mode_id in supported] if isinstance(supported, list) else []
     mode_map = _mode_map_for_ids(family, mode_ids)
 
     return DeviceProfile(

@@ -10,9 +10,7 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/kmich/ha-aiper/issues",
   "requirements": [
-    "awsiotsdk>=1.29.0",
-    "certifi>=2024.0.0",
-    "requests>=2.31.0"
+    "awsiotsdk>=1.29.0"
   ],
   "version": "0.7.3"
 }

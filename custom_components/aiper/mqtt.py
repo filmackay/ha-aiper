@@ -1,6 +1,7 @@
 """AWS IoT MQTT transport for Aiper devices."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -22,6 +23,12 @@ def _wait_crt_operation(operation: Future[_T] | tuple[Future[_T], int], timeout:
     """
     future = operation[0] if isinstance(operation, tuple) else operation
     return future.result(timeout=timeout)
+
+
+async def _async_wait_crt_operation(operation: Future[_T] | tuple[Future[_T], int], timeout: float) -> _T:
+    """Wait for an AWS CRT operation result without blocking the event loop."""
+    future = operation[0] if isinstance(operation, tuple) else operation
+    return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -63,33 +70,7 @@ class AwsIotMqttTransport:
     def connect(self) -> bool:
         """Connect to AWS IoT Core using SigV4-signed MQTT over WebSockets."""
         try:
-            from awscrt import auth
-            from awsiot import mqtt_connection_builder
-
-            credentials_provider = auth.AwsCredentialsProvider.new_static(
-                self.credentials.access_key_id,
-                self.credentials.secret_access_key,
-                self.credentials.session_token,
-            )
-
-            self._connection = mqtt_connection_builder.websockets_with_default_aws_signing(
-                endpoint=self.endpoint,
-                region=self.region,
-                credentials_provider=credentials_provider,
-                client_id=self.client_id,
-                clean_session=False,
-                keep_alive_secs=60,
-                ping_timeout_ms=5000,
-                reconnect_min_timeout_secs=1,
-                reconnect_max_timeout_secs=30,
-                protocol_operation_timeout_ms=int(self.operation_timeout * 1000),
-                enable_metrics_collection=False,
-                on_connection_interrupted=self._on_connection_interrupted,
-                on_connection_resumed=self._on_connection_resumed,
-                on_connection_failure=self._on_connection_failure,
-                on_connection_closed=self._on_connection_closed,
-            )
-
+            self._connection = self._build_connection()
             self._connection.connect().result(timeout=self.connect_timeout)
             self._connected = True
             self.last_error = None
@@ -102,6 +83,51 @@ class AwsIotMqttTransport:
             _LOGGER.error("AWS IoT MQTT connection failed: %s", err)
             return False
 
+    async def async_connect(self) -> bool:
+        """Connect to AWS IoT Core using SigV4-signed MQTT over WebSockets."""
+        try:
+            self._connection = self._build_connection()
+            await _async_wait_crt_operation(self._connection.connect(), self.connect_timeout)
+            self._connected = True
+            self.last_error = None
+            self.last_connected_at = datetime.now(UTC)
+            _LOGGER.info("Connected to AWS IoT MQTT endpoint %s", self.endpoint)
+            return True
+        except Exception as err:
+            self._connected = False
+            self.last_error = f"{type(err).__name__}: {err}"
+            _LOGGER.error("AWS IoT MQTT connection failed: %s", err)
+            return False
+
+    def _build_connection(self) -> Any:
+        """Build an AWS IoT MQTT connection object."""
+        from awscrt import auth
+        from awsiot import mqtt_connection_builder
+
+        credentials_provider = auth.AwsCredentialsProvider.new_static(
+            self.credentials.access_key_id,
+            self.credentials.secret_access_key,
+            self.credentials.session_token,
+        )
+
+        return mqtt_connection_builder.websockets_with_default_aws_signing(
+            endpoint=self.endpoint,
+            region=self.region,
+            credentials_provider=credentials_provider,
+            client_id=self.client_id,
+            clean_session=False,
+            keep_alive_secs=60,
+            ping_timeout_ms=5000,
+            reconnect_min_timeout_secs=1,
+            reconnect_max_timeout_secs=30,
+            protocol_operation_timeout_ms=int(self.operation_timeout * 1000),
+            enable_metrics_collection=False,
+            on_connection_interrupted=self._on_connection_interrupted,
+            on_connection_resumed=self._on_connection_resumed,
+            on_connection_failure=self._on_connection_failure,
+            on_connection_closed=self._on_connection_closed,
+        )
+
     def disconnect(self) -> None:
         """Disconnect from AWS IoT Core."""
         connection = self._connection
@@ -112,6 +138,22 @@ class AwsIotMqttTransport:
 
         try:
             connection.disconnect().result(timeout=self.operation_timeout)
+        except Exception as err:
+            self.last_error = f"{type(err).__name__}: {err}"
+            _LOGGER.debug("AWS IoT MQTT disconnect failed: %s", err)
+        finally:
+            self._connection = None
+
+    async def async_disconnect(self) -> None:
+        """Disconnect from AWS IoT Core without blocking the event loop."""
+        connection = self._connection
+        self._connected = False
+        self.last_disconnected_at = datetime.now(UTC)
+        if connection is None:
+            return
+
+        try:
+            await _async_wait_crt_operation(connection.disconnect(), self.operation_timeout)
         except Exception as err:
             self.last_error = f"{type(err).__name__}: {err}"
             _LOGGER.debug("AWS IoT MQTT disconnect failed: %s", err)
@@ -149,6 +191,33 @@ class AwsIotMqttTransport:
             _LOGGER.error("AWS IoT MQTT subscribe failed for %s: %s", topic, err)
             return False
 
+    async def async_subscribe(self, topic: str, callback: MessageCallback, qos: int = 1) -> bool:
+        """Subscribe to a topic and dispatch raw payload bytes to callback."""
+        if not self._connection:
+            self.last_error = "MQTT connection is not initialized"
+            return False
+
+        try:
+            from awscrt import mqtt
+
+            mqtt_qos = mqtt.QoS.AT_LEAST_ONCE if int(qos) == 1 else mqtt.QoS.AT_MOST_ONCE
+
+            def _callback(topic: str, payload: bytes, *args: Any, **kwargs: Any) -> None:
+                try:
+                    callback(topic, bytes(payload))
+                except Exception as err:
+                    _LOGGER.error("MQTT callback failed for topic %s: %s", topic, err)
+
+            await _async_wait_crt_operation(
+                self._connection.subscribe(topic=topic, qos=mqtt_qos, callback=_callback),
+                self.operation_timeout,
+            )
+            return True
+        except Exception as err:
+            self.last_error = f"{type(err).__name__}: {err}"
+            _LOGGER.error("AWS IoT MQTT subscribe failed for %s: %s", topic, err)
+            return False
+
     def publish(self, topic: str, payload: str | bytes, qos: int = 1) -> bool:
         """Publish a message to a topic."""
         if not self._connection:
@@ -161,6 +230,27 @@ class AwsIotMqttTransport:
             mqtt_qos = mqtt.QoS.AT_LEAST_ONCE if int(qos) == 1 else mqtt.QoS.AT_MOST_ONCE
             payload_bytes = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
             _wait_crt_operation(
+                self._connection.publish(topic=topic, payload=payload_bytes, qos=mqtt_qos),
+                self.operation_timeout,
+            )
+            return True
+        except Exception as err:
+            self.last_error = f"{type(err).__name__}: {err}"
+            _LOGGER.error("AWS IoT MQTT publish failed for %s: %s", topic, err)
+            return False
+
+    async def async_publish(self, topic: str, payload: str | bytes, qos: int = 1) -> bool:
+        """Publish a message to a topic without blocking the event loop."""
+        if not self._connection:
+            self.last_error = "MQTT connection is not initialized"
+            return False
+
+        try:
+            from awscrt import mqtt
+
+            mqtt_qos = mqtt.QoS.AT_LEAST_ONCE if int(qos) == 1 else mqtt.QoS.AT_MOST_ONCE
+            payload_bytes = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+            await _async_wait_crt_operation(
                 self._connection.publish(topic=topic, payload=payload_bytes, qos=mqtt_qos),
                 self.operation_timeout,
             )

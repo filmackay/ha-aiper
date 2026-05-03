@@ -1,6 +1,8 @@
 """Constants for the Aiper integration."""
 from __future__ import annotations
 
+from enum import IntEnum, StrEnum
+
 DOMAIN = "aiper"
 
 # Options
@@ -24,14 +26,8 @@ DEFAULT_CLEAN_PATH_REFRESH_HOURS = 6
 API_ENDPOINTS = {
     "us": "https://apiamerica.aiper.com",
     "eu": "https://apieurope.aiper.com",
-    "asia": "https://apiasia.aiper.com",
-    # Australia accounts are served by the Asia/Pacific backend.
-    "au": "https://apiasia.aiper.com",
+    "asia": "https://apiasia.aiper.com"
 }
-
-# AWS IoT Configuration
-AWS_IOT_ENDPOINT = "iot.aiper.com"  # Will be retrieved from API
-AWS_REGION = "us-east-1"  # Default, may vary by user region
 
 # MQTT Topics (templates with {sn} placeholder)
 TOPIC_READ = "aiper/things/{sn}/upChan"
@@ -48,53 +44,88 @@ TOPIC_SHADOW_REPORT_X9 = "aiper/things/{sn}/app/report"
 # XOR Key for message encryption
 XOR_KEY = bytes([0x12, 0x34, 0x56, 0x78])
 
-# Device status codes
-STATUS_IDLE = 0
-STATUS_CLEANING = 1
-STATUS_RETURNING = 2
-STATUS_CHARGING = 3
-STATUS_CHARGED = 4
-STATUS_ERROR = 5
-STATUS_SLEEPING = 6
+class Status(IntEnum):
+    """Known Aiper device status values carried in the lower status bits."""
 
-STATUS_MAP = {
-    STATUS_IDLE: "Idle",
-    STATUS_CLEANING: "Cleaning",
-    STATUS_RETURNING: "Returning",
-    STATUS_CHARGING: "Charging",
-    STATUS_CHARGED: "Charged",
-    STATUS_ERROR: "Error",
-    STATUS_SLEEPING: "Sleeping",
-}
+    IDLE = 0
+    CLEANING = 1
+    RETURNING = 2
+    CHARGING = 3
+    CHARGED = 4
+    ERROR = 5
+    SLEEPING = 6
 
-SCUBA_MODEL_MARKERS = ("scuba",)
+
+STATUS_VALUE_MASK = 0x7F
+STATUS_HIGH_BIT = 0x80
+
+
+def status_value(status: int | Status) -> int | None:
+    """Return the lower-bit status value from a raw status code."""
+    try:
+        return int(status) & STATUS_VALUE_MASK
+    except (TypeError, ValueError):
+        return None
+
+
+def status_high_bit(status: int | Status) -> bool:
+    """Return whether the observed high status bit is set."""
+    try:
+        return bool(int(status) & STATUS_HIGH_BIT)
+    except (TypeError, ValueError):
+        return False
+
+
+def status_label(status: int | Status) -> str:
+    """Return a display label for a known status code."""
+    value = status_value(status)
+    if value is None:
+        return f"Status {status}"
+    try:
+        return Status(value).name.replace("_", " ").title()
+    except ValueError:
+        return f"Status {status}"
+
+
+class Mode(IntEnum):
+    """Default Aiper cleaning mode IDs.
+
+    Mode IDs are device-specific. Use these only as fallback labels when the
+    coordinator has not discovered a device-specific mode map.
+    """
+
+    SMART = 1
+    FLOOR = 2
+    WALL = 3
+    WATERLINE = 4
+    SCHEDULED = 5
+
+
+class ModelMarker(StrEnum):
+    """Model-name markers used for broad device-family detection."""
+
+    SCUBA = "scuba"
+    SURFER = "surfer"
+    SHARK = "shark"
+
 
 # Cleaning modes
 #
 # IMPORTANT: These numeric codes are device-specific. For Scuba X1 we have observed
 # that the device reports a numeric `Machine.mode` that maps to app modes. Current mapping (based on testing): 1=Smart, 2=Floor, 3=Wall, 4=Waterline.
 #
-# The other modes are inferred and should be validated against the official app or by
-# experimenting with `AT+MODE=<n>` via the `aiper.send_at_command` service.
+# Other modes are inferred and should be validated with the probe tooling before
+# being exposed as stable Home Assistant controls.
 
-# "Scheduled" mode: the device performs an ~50 minute run, powers down, and will
-# attempt to run again ~48 hours later if battery is sufficient (as per app behavior).
-# Empirically, this appears to be a distinct MODE value, not an "AT+PLAN" command.
-MODE_SCHEDULED = 5
-MODE_FLOOR = 2
-MODE_SMART = 1
-MODE_WALL = 3
-MODE_WATERLINE = 4
-
-MODE_MAP = {
+MODE_MAP: dict[int, str] = {
     # NOTE: Mode IDs are device-specific and not documented publicly.
     # For Scuba X1 (tested): Machine.mode=1=Smart, 2=Floor, 3=Wall, 4=Waterline.
-    # If your device reports different IDs, use the `aiper.send_at_command` service to experiment with `AT+MODE=<n>`.
-    MODE_SCHEDULED: "Scheduled",
-    MODE_SMART: "Smart",
-    MODE_FLOOR: "Floor",
-    MODE_WALL: "Wall",
-    MODE_WATERLINE: "Waterline",
+    # If your device reports different IDs, validate them with the probe tooling before exposing them.
+    int(Mode.SCHEDULED): "Scheduled",
+    int(Mode.SMART): "Smart",
+    int(Mode.FLOOR): "Floor",
+    int(Mode.WALL): "Wall",
+    int(Mode.WATERLINE): "Waterline",
 }
 
 # Warning codes (partial list, expand as discovered)
@@ -130,3 +161,7 @@ CLEAN_PATH_MAP: dict[int, str] = {
 }
 
 CLEAN_PATH_LABEL_TO_VALUE: dict[str, int] = {v: k for k, v in CLEAN_PATH_MAP.items()}
+
+# Surfer S2 run control/status codes verified on 2026-05-03.
+SURFER_RUN_STOP_MODE = 0
+SURFER_RUN_START_MODE = 1

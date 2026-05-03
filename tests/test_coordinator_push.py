@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any, cast
 
 import pytest
+from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from custom_components.aiper.coordinator import AiperDataUpdateCoordinator
@@ -54,7 +56,8 @@ def test_shadow_update_promotes_live_state_in_push_primary_mode() -> None:
 
     device = coordinator.data["SN123"]
     assert device["battLevel"] == 70
-    assert device["machineStatus"] == 129
+    assert device["machineStatus"] == 1
+    assert device["running"] is True
     assert device["mode"] == 5
     assert device["_ha_online"] is True
     assert device["wifiName"] == "Mackay"
@@ -69,7 +72,7 @@ def test_set_push_primary_switches_update_interval() -> None:
     coordinator = AiperDataUpdateCoordinator.__new__(AiperDataUpdateCoordinator)
     coordinator._push_reconcile_interval = timedelta(hours=1)
     coordinator._normal_interval = timedelta(seconds=120)
-    coordinator._fast_poll_until = "set"
+    coordinator._fast_poll_until = dt_util.utcnow()
     coordinator.update_interval = None
 
     coordinator.set_push_primary(True)
@@ -83,12 +86,8 @@ def test_set_push_primary_switches_update_interval() -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_primary_refresh_skips_live_rest_polling() -> None:
+async def test_push_primary_refresh_skips_live_rest_polling(hass: HomeAssistant) -> None:
     """Scheduled push-primary refreshes should not poll live device state."""
-
-    class FakeHass:
-        async def async_add_executor_job(self, func, *args):
-            return func(*args)
 
     class FakeApi:
         def get_devices(self):
@@ -100,15 +99,19 @@ async def test_push_primary_refresh_skips_live_rest_polling() -> None:
         def get_device_info(self, sn):
             raise AssertionError("live info should not be polled")
 
+        async def query_clean_path_setting(self, sn):
+            raise AssertionError("devices without clean-path support should not poll clean-path REST")
+
     now = dt_util.utcnow()
     coordinator = AiperDataUpdateCoordinator.__new__(AiperDataUpdateCoordinator)
-    coordinator.hass = FakeHass()
-    coordinator.api = FakeApi()
+    coordinator.hass = hass
+    coordinator.api = cast(Any, FakeApi())
     coordinator._push_primary = True
     coordinator._devices = {
         "SN123": {
             "sn": "SN123",
-            "name": "Surfer S2",
+            "name": "Unknown Aiper",
+            "model": "Unknown_Model",
             "status_data": {"online": False},
             "info": {"mainVersion": "old"},
             "_ha_online": False,
@@ -124,7 +127,7 @@ async def test_push_primary_refresh_skips_live_rest_polling() -> None:
     coordinator._clean_path_refresh = timedelta(hours=6)
     coordinator._last_history_fetch = {"SN123": now}
     coordinator._last_consumables_fetch = {"SN123": now}
-    coordinator._last_clean_path_fetch = {"SN123": now}
+    coordinator._last_clean_path_fetch = {}
     coordinator._history_cache = {"SN123": {"total_count": 1, "total_hours": 2.0, "records": []}}
     coordinator._consumables_cache = {"SN123": []}
     coordinator._clean_path_cache = {}
@@ -134,3 +137,4 @@ async def test_push_primary_refresh_skips_live_rest_polling() -> None:
 
     assert data["SN123"]["_ha_online"] is True
     assert data["SN123"]["shadow"]["machine"]["cap"] == 70
+    assert data["SN123"]["_ha_clean_path"] is None

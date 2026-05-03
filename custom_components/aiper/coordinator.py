@@ -5,6 +5,7 @@ import logging
 from datetime import timedelta, datetime, timezone
 from typing import Any
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -20,7 +21,8 @@ from .const import (
     DOMAIN,
     MODE_MAP,
 )
-from .profiles import derive_device_profile
+from .profiles import Capability, derive_device_profile, has_capability
+from .state import normalize_device_state
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -638,8 +640,8 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             if not isinstance(item, dict):
                 continue
 
-            mode_id = _deep_get(item, ("modeId", "mode_id", "cleanMode", "cleanType", "mode", "type"))
-            mode_name = _deep_get(item, ("modeName", "cleanModeName", "mode_name", "name", "cleanTypeName"))
+            mode_id = _deep_get(item, ("modeId", "mode_id", "cleanType", "mode", "type"))
+            mode_name = _deep_get(item, ("modeName", "mode_name", "name", "cleanTypeName"))
             try:
                 mid_int = int(mode_id) if mode_id is not None and str(mode_id).strip().lstrip('-').isdigit() else None
             except Exception:
@@ -963,6 +965,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         clean_path_refresh_hours: int = DEFAULT_CLEAN_PATH_REFRESH_HOURS,
         push_primary: bool = False,
         push_reconcile_interval: int = DEFAULT_PUSH_RECONCILE_INTERVAL,
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         """Initialize the coordinator."""
         self._normal_interval = timedelta(seconds=max(5, int(scan_interval)))
@@ -976,6 +979,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
             update_interval=self._push_reconcile_interval if self._push_primary else self._normal_interval,
         )
@@ -1044,6 +1048,8 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         device["_ha_profile_family"] = profile.family.value
         device["_ha_capabilities"] = sorted(capability.value for capability in profile.capabilities)
         device["_ha_mode_map"] = profile.mode_map
+        device["shadow"] = self._shadow_data.get(sn, {})
+        normalize_device_state(device)
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from API."""
@@ -1064,7 +1070,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 devices = list(self._devices.values())
                 _LOGGER.debug("Reconciling slow REST metadata for %d MQTT-driven devices", len(devices))
             else:
-                devices = await self.hass.async_add_executor_job(self.api.get_devices)
+                devices = await self.api.get_devices()
                 _LOGGER.debug("Got %d devices from API", len(devices))
             
             for device in devices:
@@ -1080,9 +1086,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else:
                     # Get device online status
                     try:
-                        status = await self.hass.async_add_executor_job(
-                            self.api.get_device_status, sn
-                        )
+                        status = await self.api.get_device_status(sn)
                     except Exception as err:
                         _LOGGER.debug("Device %s status fetch failed: %s", sn, err)
                 if status:
@@ -1098,9 +1102,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else:
                     # Get detailed device info (may contain state)
                     try:
-                        info = await self.hass.async_add_executor_job(
-                            self.api.get_device_info, sn
-                        )
+                        info = await self.api.get_device_info(sn)
                     except Exception as err:
                         _LOGGER.debug("Device %s info fetch failed: %s", sn, err)
                 if info:
@@ -1183,7 +1185,6 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "workModeList",
                             "supportedModes",
                             "supportModes",
-                            "cleanModeList",
                         ):
                             if k in info:
                                 candidates.append(info.get(k))
@@ -1299,7 +1300,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if sn_just_online or last_h is None or (now - last_h) >= self._history_refresh:
                     raw_hist = None
                     try:
-                        raw_hist = await self.hass.async_add_executor_job(self.api.get_cleaning_history, sn)
+                        raw_hist = await self.api.get_cleaning_history(sn)
                     except Exception as err:
                         _LOGGER.debug("Cleaning history fetch failed for %s: %s", sn, err)
                     tcount, thours, recs = _parse_cleaning_history(raw_hist)
@@ -1329,7 +1330,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if sn_just_online or last_c is None or (now - last_c) >= self._consumables_refresh:
                     raw_cons = None
                     try:
-                        raw_cons = await self.hass.async_add_executor_job(self.api.get_consumables, sn)
+                        raw_cons = await self.api.get_consumables(sn)
                     except Exception as err:
                         _LOGGER.debug("Consumables fetch failed for %s: %s", sn, err)
                     cons_list = _parse_consumables(raw_cons)
@@ -1339,22 +1340,29 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._consumables_cache[sn] = cons_list
                     self._last_consumables_fetch[sn] = now
                 self._devices[sn]["_ha_consumables"] = self._consumables_cache.get(sn) or []
+                self._apply_device_profile(sn)
 
                 # Clean path preference
-                last_p = _ensure_utc_aware(self._last_clean_path_fetch.get(sn))
-                if sn_just_online or last_p is None or (now - last_p) >= self._clean_path_refresh:
-                    val = None
-                    try:
-                        val = await self.hass.async_add_executor_job(self.api.query_clean_path_setting, sn)
-                    except Exception as err:
-                        _LOGGER.debug("Clean path fetch failed for %s: %s", sn, err)
-                    # Only update cache if the API returned a value (avoid overwriting
-                    # a previously known setting with None due to transient failures).
-                    if val is not None:
-                        self.set_clean_path_cache(sn, val)
-                    self._last_clean_path_fetch[sn] = now
-                self._devices[sn]["_ha_clean_path"] = self._clean_path_cache.get(sn)
-                self._apply_device_profile(sn)
+                # Surfer S2 is verified to support this via the current single
+                # clean-path REST contract. The capability gate keeps Shark/unknown
+                # devices out and confines the remaining legacy matrix to families
+                # still pending hardware verification.
+                if has_capability(self._devices[sn], Capability.CLEAN_PATH):
+                    last_p = _ensure_utc_aware(self._last_clean_path_fetch.get(sn))
+                    if sn_just_online or last_p is None or (now - last_p) >= self._clean_path_refresh:
+                        val = None
+                        try:
+                            val = await self.api.query_clean_path_setting(sn)
+                        except Exception as err:
+                            _LOGGER.debug("Clean path fetch failed for %s: %s", sn, err)
+                        # Only update cache if the API returned a value (avoid overwriting
+                        # a previously known setting with None due to transient failures).
+                        if val is not None:
+                            self.set_clean_path_cache(sn, val)
+                        self._last_clean_path_fetch[sn] = now
+                    self._devices[sn]["_ha_clean_path"] = self._clean_path_cache.get(sn)
+                else:
+                    self._devices[sn]["_ha_clean_path"] = None
 
             # Expire pending commands (UI hints)
             for _sn in list(self._command_state.keys()):
@@ -1697,6 +1705,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._push_primary:
                 dev.update(self._devices.get(sn, {}))
             dev["shadow"] = shadow
+            normalize_device_state(dev)
             new_data[sn] = dev
             self.async_set_updated_data(new_data)
 

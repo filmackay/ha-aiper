@@ -122,6 +122,12 @@ def _is_wifi_connected(data: dict) -> bool | None:
     return sta in (1, 2, "1", "2")
 
 
+def _is_running(data: dict) -> bool | None:
+    """Return coordinator-normalized running state."""
+    running = data.get("running")
+    return running if isinstance(running, bool) else None
+
+
 def _device_model(data: dict) -> str:
     """Return the most specific model string available."""
     return str(
@@ -148,6 +154,14 @@ BINARY_SENSOR_DESCRIPTIONS: tuple[AiperBinarySensorEntityDescription, ...] = (
         value_fn=_is_in_water,
         enabled_default=True,
         capability=Capability.IN_WATER,
+    ),
+    AiperBinarySensorEntityDescription(
+        key="running",
+        name="Running",
+        icon="mdi:run",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        value_fn=_is_running,
+        available_fn=lambda data: data.get("running") is not None,
     ),
     AiperBinarySensorEntityDescription(
         key="solar_charging",

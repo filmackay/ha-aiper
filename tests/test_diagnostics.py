@@ -5,15 +5,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.aiper.const import DOMAIN
 from custom_components.aiper.diagnostics import async_get_config_entry_diagnostics
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_redacts_sensitive_runtime_data() -> None:
+async def test_diagnostics_redacts_sensitive_runtime_data(hass: HomeAssistant) -> None:
     """Diagnostics should not expose credentials, tokens, or AWS secrets."""
-    entry = SimpleNamespace(
+    entry = MockConfigEntry(
+        domain=DOMAIN,
         entry_id="entry-1",
         title="Aiper",
         data={
@@ -38,6 +41,7 @@ async def test_diagnostics_redacts_sensitive_runtime_data() -> None:
         data={
             "SN123": {
                 "name": "Pool Robot",
+                "deviceModelUrl": "https://static.example.test/surfer-s2.png",
                 "token": "runtime-token",
                 "nested": {"SecretKey": "aws-secret"},
             }
@@ -53,7 +57,7 @@ async def test_diagnostics_redacts_sensitive_runtime_data() -> None:
             }
         },
     )
-    hass = SimpleNamespace(data={DOMAIN: {entry.entry_id: {"api": api, "coordinator": coordinator}}})
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"api": api, "coordinator": coordinator}
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -62,6 +66,8 @@ async def test_diagnostics_redacts_sensitive_runtime_data() -> None:
         "username": "per...com",
     }
     assert diagnostics["devices"]["SN123"]["token"] == "***"
+    assert diagnostics["devices"]["SN123"]["deviceModelUrl"] == "https://static.example.test/surfer-s2.png"
+    assert diagnostics["device_model_images"] == {"SN123": "https://static.example.test/surfer-s2.png"}
     assert diagnostics["devices"]["SN123"]["nested"]["SecretKey"] == "***"
     assert diagnostics["command_state"]["SN123"]["pending"]["mode"]["accessKeyId"] == "***"
     assert diagnostics["command_state"]["SN123"]["pending"]["mode"]["value"] == 1

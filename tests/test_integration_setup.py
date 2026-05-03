@@ -1,0 +1,120 @@
+"""Tests for integration setup and unload wiring."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, cast
+
+import pytest
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components import aiper
+from custom_components.aiper.coordinator import AiperDataUpdateCoordinator
+from custom_components.aiper.const import DOMAIN
+
+
+@dataclass
+class FakeApi:
+    """Fake Aiper API used by setup/unload tests."""
+
+    username: str
+    password: str
+    region: str
+    async_session: object | None = None
+    login_called: bool = False
+    connect_called: bool = False
+    disconnected: bool = False
+    shadow_requested: list[str] = field(default_factory=list)
+
+    async def login(self) -> bool:
+        self.login_called = True
+        return True
+
+    async def get_devices(self) -> list[dict[str, Any]]:
+        return [{"sn": "SN123", "model": "Shark_X", "name": "Pool Robot", "battLevel": 80, "machineStatus": 1}]
+
+    async def get_device_status(self, sn: str) -> dict[str, Any]:
+        return {"online": True}
+
+    async def get_device_info(self, sn: str) -> dict[str, Any]:
+        return {"mainVersion": "1.0.0"}
+
+    async def get_cleaning_history(self, sn: str) -> dict[str, Any]:
+        return {"data": {"list": []}}
+
+    async def get_consumables(self, sn: str) -> dict[str, Any]:
+        return {"data": []}
+
+    async def query_clean_path_setting(self, sn: str) -> int | None:
+        return None
+
+    async def connect_mqtt(self) -> bool:
+        self.connect_called = True
+        return False
+
+    async def request_shadow(self, sn: str) -> bool:
+        self.shadow_requested.append(sn)
+        return True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_stores_runtime_data_and_unload_disconnects(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setup should create API/coordinator state and unload should clean it up."""
+
+    forwarded: list[tuple[ConfigEntry, list[Platform]]] = []
+    unloaded: list[tuple[ConfigEntry, list[Platform]]] = []
+
+    async def fake_forward_entry_setups(entry: ConfigEntry, platforms: list[Platform]) -> None:
+        forwarded.append((entry, platforms))
+
+    async def fake_unload_platforms(entry: ConfigEntry, platforms: list[Platform]) -> bool:
+        unloaded.append((entry, platforms))
+        return True
+
+    monkeypatch.setattr(aiper, "AiperApi", FakeApi)
+    monkeypatch.setattr(aiper, "async_get_clientsession", lambda hass: "session")
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", fake_forward_entry_setups)
+    monkeypatch.setattr(hass.config_entries, "async_unload_platforms", fake_unload_platforms)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="entry-1",
+        data={
+            "username": "user@example.com",
+            "password": "secret",
+            "region": "asia",
+        },
+        options={"enable_mqtt": True},
+        state=ConfigEntryState.SETUP_IN_PROGRESS,
+    )
+    entry.add_to_hass(hass)
+
+    assert await aiper.async_setup_entry(hass, cast(ConfigEntry, entry)) is True
+
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    api = cast(FakeApi, runtime["api"])
+    coordinator = cast(AiperDataUpdateCoordinator, runtime["coordinator"])
+
+    assert api.login_called is True
+    assert api.connect_called is True
+    assert api.async_session == "session"
+    assert coordinator.data is not None
+    assert coordinator.data["SN123"]["name"] == "Pool Robot"
+    assert coordinator.data["SN123"]["_ha_profile_family"] == "shark"
+    assert coordinator.update_interval == coordinator._normal_interval
+    assert forwarded == [(cast(ConfigEntry, entry), aiper.PLATFORMS)]
+
+    assert await aiper.async_unload_entry(hass, cast(ConfigEntry, entry)) is True
+
+    assert unloaded == [(cast(ConfigEntry, entry), aiper.PLATFORMS)]
+    assert api.disconnected is True
+    assert entry.entry_id not in hass.data[DOMAIN]

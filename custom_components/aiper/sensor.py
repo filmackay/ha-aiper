@@ -17,8 +17,9 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, STATUS_MAP, MODE_MAP, CLEAN_PATH_MAP
+from .const import DOMAIN, MODE_MAP, CLEAN_PATH_MAP, status_label
 from .coordinator import AiperDataUpdateCoordinator
+from .device_images import device_model_image_url
 from .profiles import Capability, has_capability
 
 
@@ -125,17 +126,18 @@ def _get_status(data: dict) -> str:
     if _is_online(data) is False:
         return "Offline"
 
+    def _label(status: Any) -> str:
+        status_id = _coerce_int(status)
+        return status_label(status_id) if status_id is not None else f"Status {status}"
+
     # REST API uses 'machineStatus' directly on device
     if "machineStatus" in data and data.get("machineStatus") is not None:
-        status = data.get("machineStatus")
-        status_id = _coerce_int(status)
-        return STATUS_MAP.get(status_id, f"Status {status}") if status_id is not None else f"Status {status}"
+        return _label(data.get("machineStatus"))
 
     # Fallback to shadow data (from MQTT)
     shadow_status = (data.get("shadow") or {}).get("machine", {}).get("status")
     if shadow_status is not None:
-        status_id = _coerce_int(shadow_status)
-        return STATUS_MAP.get(status_id, f"Status {shadow_status}") if status_id is not None else f"Status {shadow_status}"
+        return _label(shadow_status)
 
     # If we are online but have no status code, present as Idle (per UX requirement)
     return "Idle"
@@ -152,9 +154,8 @@ def _get_mode(data: dict) -> str:
             return f"Mode {mode}" if mode is not None else "Unknown"
         return mode_map.get(mode_id) or MODE_MAP.get(mode_id, f"Mode {mode_id}")
 
-    # Check for mode in device data
-    if "cleanMode" in data:
-        return _label(data.get("cleanMode"))
+    # Prefer coordinator-normalized mode. Fallback is for older coordinator
+    # data during reloads/tests before normalization has run.
     if "mode" in data:
         return _label(data.get("mode"))
     # Fallback to shadow data (from MQTT)
@@ -363,21 +364,29 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         icon="mdi:robot-vacuum",
         value_fn=_get_status,
     ),
-    # Note: "mode" sensor is handled separately by AiperCleaningModeSensor
+    AiperSensorEntityDescription(
+        key="mode",
+        name="Mode",
+        icon="mdi:robot-vacuum",
+        value_fn=_get_mode,
+        available_fn=lambda data: (
+            data.get("mode") is not None
+            or data.get("shadow", {}).get("machine", {}).get("mode") is not None
+        ),
+    ),
     AiperSensorEntityDescription(
         key="mode_code",
         name="Cleaning Mode Code",
         icon="mdi:numeric",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: (
-            data.get("shadow", {}).get("machine", {}).get("mode")
-            if data.get("shadow", {}).get("machine", {}).get("mode") is not None
-            else data.get("mode", data.get("cleanMode"))
+            data.get("mode")
+            if data.get("mode") is not None
+            else data.get("shadow", {}).get("machine", {}).get("mode")
         ),
         available_fn=lambda data: (
-            data.get("shadow", {}).get("machine", {}).get("mode") is not None
-            or data.get("mode") is not None
-            or data.get("cleanMode") is not None
+            data.get("mode") is not None
+            or data.get("shadow", {}).get("machine", {}).get("mode") is not None
         ),
         enabled_default=False,
     ),
@@ -509,7 +518,7 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data.get("_ha_fw_main") or (data.get("info") or {}).get("mainVersion") or (data.get("info") or {}).get("mainVer"),
         available_fn=lambda data: (data.get("_ha_fw_main") or (data.get("info") or {}).get("mainVersion") or (data.get("info") or {}).get("mainVer")) is not None,
-        enabled_default=True,
+        enabled_default=False,
     ),
     AiperSensorEntityDescription(
         key="mcu_version",
@@ -517,7 +526,7 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data.get("_ha_fw_mcu") or (data.get("info") or {}).get("mcuVersion") or (data.get("info") or {}).get("mcuVer"),
         available_fn=lambda data: (data.get("_ha_fw_mcu") or (data.get("info") or {}).get("mcuVersion") or (data.get("info") or {}).get("mcuVer")) is not None,
-        enabled_default=True,
+        enabled_default=False,
     ),
     AiperSensorEntityDescription(
         key="ip_address",
@@ -525,7 +534,7 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data.get("_ha_ip_address") or (data.get("info") or {}).get("ipAddress") or (data.get("info") or {}).get("ip"),
         available_fn=lambda data: (data.get("_ha_ip_address") or (data.get("info") or {}).get("ipAddress") or (data.get("info") or {}).get("ip")) is not None,
-        enabled_default=True,
+        enabled_default=False,
     ),
     AiperSensorEntityDescription(
         key="ap_hotspot",
@@ -533,7 +542,7 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data.get("_ha_ap_hotspot") or (data.get("info") or {}).get("apHotspot") or (data.get("info") or {}).get("ap"),
         available_fn=lambda data: (data.get("_ha_ap_hotspot") or (data.get("info") or {}).get("apHotspot") or (data.get("info") or {}).get("ap")) is not None,
-        enabled_default=True,
+        enabled_default=False,
     ),
     AiperSensorEntityDescription(
         key="bluetooth_name",
@@ -541,7 +550,7 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda data: data.get("_ha_bluetooth_name") or (data.get("info") or {}).get("bluetoothName") or (data.get("info") or {}).get("btName"),
         available_fn=lambda data: (data.get("_ha_bluetooth_name") or (data.get("info") or {}).get("bluetoothName") or (data.get("info") or {}).get("btName")) is not None,
-        enabled_default=True,
+        enabled_default=False,
     ),
     AiperSensorEntityDescription(
         key="clean_path",
@@ -742,6 +751,15 @@ class AiperSensor(CoordinatorEntity[AiperDataUpdateCoordinator], SensorEntity):
         """Return the state of the sensor."""
         if self.coordinator.data and self._sn in self.coordinator.data:
             return self.entity_description.value_fn(self.coordinator.data[self._sn])
+        return None
+
+    @property
+    def entity_picture(self) -> str | None:
+        """Return a device model image for the primary status sensor."""
+        if self.entity_description.key != "status":
+            return None
+        if self.coordinator.data and self._sn in self.coordinator.data:
+            return device_model_image_url(self.coordinator.data[self._sn])
         return None
 
     @property

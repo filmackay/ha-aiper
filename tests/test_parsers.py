@@ -68,13 +68,13 @@ def test_parse_cleaning_history_handles_surfer_s2_long_runs() -> None:
             "data": {
                 "list": [
                     {
-                        "cleanMode": "5",
+                        "mode": "5",
                         "cleanTime": 14401,
                         "cleanTimeMin": 240,
                         "utcStartTimeStamp": 1777741200000,
                     },
                     {
-                        "cleanMode": "1",
+                        "mode": "1",
                         "cleanTime": 49713,
                         "cleanTimeMin": 828,
                         "utcStartTimeStamp": 1777691487000,

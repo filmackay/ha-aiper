@@ -1,8 +1,9 @@
 """Aiper API Client for REST and MQTT communication."""
 from __future__ import annotations
 
+import asyncio
 import base64
-from functools import partial
+from collections.abc import Awaitable
 import json
 import logging
 import threading
@@ -14,12 +15,12 @@ from collections import defaultdict, deque
 
 from datetime import datetime
 
+import aiohttp
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
-
-import requests
 
 from .const import (
     API_ENDPOINTS,
@@ -34,11 +35,14 @@ from .const import (
     TOPIC_SHADOW_UPDATE_DOCUMENTS,
     TOPIC_SHADOW_REPORT,
     TOPIC_SHADOW_REPORT_X9,
+    SURFER_RUN_START_MODE,
+    SURFER_RUN_STOP_MODE,
     X9_SERIES_PREFIXES,
 )
 
 from .crypto import AiperEncryption
 from .mqtt import AwsIotCredentials, AwsIotMqttTransport
+from .profiles import DeviceFamily, device_family
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,12 +55,15 @@ class AiperApi:
         username: str,
         password: str,
         region: str = "eu",
+        async_session: aiohttp.ClientSession | None = None,
     ) -> None:
         """Initialize the API client."""
         self.username = username
         self.password = password
         self.region = region
         self.base_url = API_ENDPOINTS.get(region, API_ENDPOINTS["eu"])
+        self._async_session = async_session
+        self._owns_async_session = False
         
         self._token: str | None = None
         self._user_id: str | None = None
@@ -82,20 +89,19 @@ class AiperApi:
         # DownChan AT command acknowledgements (received on upChan as "+OK" / "+ERROR").
         # We keep a small per-device FIFO so we can wait for the next ack after a publish.
         self._ack_lock = threading.Lock()
-        self._ack_events: dict[str, threading.Event] = defaultdict(threading.Event)
         self._ack_fifo: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=10))
+        self._async_ack_events: dict[str, asyncio.Event] = {}
+        self._async_loop: asyncio.AbstractEventLoop | None = None
 
         # Serialize command sends per device SN so that ack correlation is reliable.
-        self._cmd_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._cmd_locks: dict[str, asyncio.Lock] = {}
         
-        # Session for REST API
         # Headers from RetrofitFactory interceptor
-        self._session = requests.Session()
         # REST call pacing to avoid triggering cloud throttling
-        self._rest_lock = threading.Lock()
+        self._async_rest_lock: asyncio.Lock | None = None
         self._rest_min_interval = 0.8  # seconds between REST calls
         self._rest_next_allowed = 0.0
-        self._session.headers.update({
+        self._headers: dict[str, str] = {
             "Content-Type": "application/json",
             "version": "3.0.0",  # App version
             "os": "android",
@@ -103,7 +109,7 @@ class AiperApi:
             "Accept-Language": "en",
             "zoneId": "Europe/Athens",
             "token": "",  # Will be set after login
-        })
+        }
 
     @staticmethod
     def _is_success(payload: dict) -> bool:
@@ -111,7 +117,50 @@ class AiperApi:
         successful = payload.get("successful")
         return str(code) in ("0", "200") or successful is True
 
-    def _call_encrypted(
+    def _device_family_for_sn(self, sn: str) -> DeviceFamily:
+        """Return the discovered family for a device serial number."""
+        return device_family(self._devices.get(sn) or {})
+
+    @staticmethod
+    def _clean_path_value_from_payload(payload: dict[str, Any]) -> int | None:
+        """Normalize a clean-path value from known REST response shapes."""
+        data = payload.get("data")
+        val: Any = None
+        if isinstance(data, dict):
+            for key in ("cleanPath", "cleanPathSetting", "clean_path_setting", "path", "value"):
+                if key in data:
+                    val = data.get(key)
+                    break
+
+        if val is None:
+            for key in ("cleanPath", "cleanPathSetting", "clean_path_setting"):
+                if isinstance(payload.get(key), (int, str)):
+                    val = payload.get(key)
+                    break
+
+        if isinstance(val, str):
+            s = val.strip()
+            if s.lstrip("-").isdigit():
+                try:
+                    val = int(s)
+                except Exception:
+                    val = None
+
+        if isinstance(val, int):
+            # Aiper's app treats -1 as the default path preference.
+            return 0 if val == -1 else int(val)
+
+        if isinstance(val, str):
+            norm = " ".join(val.lower().replace("_", " ").replace("-", " ").split())
+            if "adaptive" in norm:
+                return 1
+            if "shape" in norm or norm.startswith("s ") or norm == "s":
+                return 0
+
+        return None
+
+
+    async def _call_encrypted(
         self,
         method: str,
         path: str,
@@ -122,44 +171,30 @@ class AiperApi:
         timeout: int = 30,
         retry_login: bool = True,
     ) -> dict[str, Any]:
-        """Call an Aiper REST endpoint using the AES/RSA envelope.
-
-        Most endpoints expect:
-          - Header: encryptKey = RSA(key+iv)
-          - Body: {"data": base64(AES_CBC_ZeroPad(json_with_nonce_ts))}
-          - Response: base64(AES(...)) which we then decrypt.
-        """
-
+        """Call an Aiper REST endpoint using the AES/RSA envelope."""
         enc = AiperEncryption()
 
-        headers = dict(self._session.headers)
+        headers = dict(self._headers)
         headers["encryptKey"] = enc.encrypt_key_header
         headers["token"] = token or (self._token or "")
 
         url_base = (base_url or self.base_url).rstrip("/")
         url = f"{url_base}{path}"
 
-        data = None
-        if body is not None:
-            data = enc.encrypt_request(body)
-
-        resp = self._request_with_backoff(method, url, headers=headers, data=data, timeout=timeout)
-        # Aiper returns HTTP 200 for most application-level errors.
-        # Decrypt first, then evaluate code/message.
-        decrypted = enc.decrypt_response(resp.text)
+        data = enc.encrypt_request(body) if body is not None else None
+        _status, text = await self._request_with_backoff(method, url, headers=headers, data=data, timeout=timeout)
+        decrypted = enc.decrypt_response(text)
 
         try:
             payload = json.loads(decrypted)
         except Exception as err:
             raise Exception(f"Failed to parse decrypted response from {path}: {decrypted[:200]}") from err
 
-        # If token expired, some stacks return code 401/403 inside JSON.
-        # Prefer token refresh (less disruptive) before performing a full login.
         if retry_login and str(payload.get("code")) in ("401", "403"):
             _LOGGER.info("Token appears expired; attempting refresh")
             try:
-                if self.refresh_token():
-                    return self._call_encrypted(
+                if await self.refresh_token():
+                    return await self._call_encrypted(
                         method,
                         path,
                         body,
@@ -172,8 +207,8 @@ class AiperApi:
                 pass
 
             _LOGGER.info("Token refresh failed; re-authenticating")
-            if self.login():
-                return self._call_encrypted(
+            if await self.login():
+                return await self._call_encrypted(
                     method,
                     path,
                     body,
@@ -185,48 +220,67 @@ class AiperApi:
 
         return payload
 
-    def _rest_wait(self) -> None:
+
+    async def _rest_wait(self) -> None:
         """Throttle REST calls to reduce cloud load and avoid rate limits."""
-        with self._rest_lock:
+        if self._async_rest_lock is None:
+            self._async_rest_lock = asyncio.Lock()
+        async with self._async_rest_lock:
             now = time.time()
             if now < self._rest_next_allowed:
-                time.sleep(self._rest_next_allowed - now)
+                await asyncio.sleep(self._rest_next_allowed - now)
             self._rest_next_allowed = time.time() + self._rest_min_interval
 
-    def _request_with_backoff(self, method: str, url: str, *, headers: dict, json_body: dict | None = None, data: Any = None, timeout: int = 30):
-        """Perform a REST request with limited retries/backoff on 429/5xx."""
+
+    async def _request_with_backoff(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        json_body: dict | None = None,
+        data: Any = None,
+        timeout: int = 30,
+    ) -> tuple[int, str]:
+        """Perform an async REST request with limited retries/backoff on 429/5xx."""
+        if self._async_session is None:
+            self._async_session = aiohttp.ClientSession()
+            self._owns_async_session = True
+
         max_attempts = 4
         delay = 1.0
-        last_exc = None
+        last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
-            self._rest_wait()
+            await self._rest_wait()
             try:
-                resp = self._session.request(
+                async with self._async_session.request(
                     method.upper(),
                     url,
                     headers=headers,
                     json=json_body,
                     data=data,
-                    timeout=timeout,
-                )
-                # Only raise for HTTP-level failures; app-level errors are often HTTP 200
-                if resp.status_code in (429, 500, 502, 503, 504):
-                    raise Exception(f"HTTP {resp.status_code}")
-                resp.raise_for_status()
-                return resp
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status in (429, 500, 502, 503, 504):
+                        raise Exception(f"HTTP {resp.status}")
+                    resp.raise_for_status()
+                    return resp.status, text
             except Exception as err:
                 last_exc = err
-                # Backoff only for likely transient / throttling errors
                 msg = str(err).lower()
-                transient = any(k in msg for k in ("429", "500", "502", "503", "504", "timeout", "tempor", "connection", "reset", "refused"))
+                transient = any(
+                    key in msg
+                    for key in ("429", "500", "502", "503", "504", "timeout", "tempor", "connection", "reset", "refused")
+                )
                 if attempt >= max_attempts or not transient:
                     break
-                # jitter
-                time.sleep(delay + random.uniform(0, 0.3))
+                await asyncio.sleep(delay + random.uniform(0, 0.3))
                 delay = min(delay * 2.0, 8.0)
         raise last_exc if last_exc else Exception("Request failed")
 
-    def _call_plain(
+
+    async def _call_plain(
         self,
         method: str,
         path: str,
@@ -236,30 +290,27 @@ class AiperApi:
         token: str | None = None,
         timeout: int = 30,
     ) -> dict[str, Any]:
-        """Call an Aiper REST endpoint without the AES/RSA envelope.
-
-        Some endpoints in the Aiper app ecosystem appear to accept (or require)
-        plain JSON rather than the encrypted request body used by most of the
-        public API. We keep this as a fallback for a small set of features.
-        """
-
-        headers = dict(self._session.headers)
+        """Call an Aiper REST endpoint without the AES/RSA envelope."""
+        headers = dict(self._headers)
         headers["token"] = token or (self._token or "")
 
         url_base = (base_url or self.base_url).rstrip("/")
         url = f"{url_base}{path}"
 
-        resp = self._request_with_backoff(method, url, headers=headers, json_body=body, timeout=timeout)
-        resp.raise_for_status()
+        status, text = await self._request_with_backoff(
+            method,
+            url,
+            headers=headers,
+            json_body=body,
+            timeout=timeout,
+        )
 
-        if not resp.text:
+        if not text:
             return {}
-
         try:
-            return resp.json()
+            return json.loads(text)
         except Exception:
-            # Best-effort fallback when server returns non-JSON error bodies.
-            return {"code": resp.status_code, "successful": False, "message": resp.text[:500]}
+            return {"code": status, "successful": False, "message": text[:500]}
 
     def _encrypt(self, data: str) -> str:
         """Encrypt message using XOR + Base64."""
@@ -276,18 +327,22 @@ class AiperApi:
             # May be unencrypted JSON
             return data.decode("utf-8") if isinstance(data, bytes) else data
 
-    def login(self) -> bool:
+
+    async def login(self) -> bool:
         """Authenticate with Aiper API."""
         _LOGGER.debug("Logging in to Aiper API")
-        
-        # Confirmed from MineApi: POST /login with email and password
-        # @o("/login")
-        # Object login(@JsonKey("email") String, @JsonKey("password") String, ...)
+
         login_data = {"email": self.username, "password": self.password}
 
         try:
             _LOGGER.debug("Logging in with email: %s", self.username)
-            payload = self._call_encrypted("POST", "/login", login_data, base_url=self.base_url, token="")
+            payload = await self._call_encrypted(
+                "POST",
+                "/login",
+                login_data,
+                base_url=self.base_url,
+                token="",
+            )
 
             if not self._is_success(payload):
                 msg = payload.get("msg") or payload.get("message") or payload.get("mess") or "Unknown error"
@@ -295,29 +350,25 @@ class AiperApi:
 
             result = payload.get("data", {}) or {}
 
-            # TokenIdInfo fields observed: token, serialNumber, tokenExpires, domain
             self._token = result.get("token")
             self._user_id = result.get("serialNumber")
             self._token_expires = result.get("tokenExpires", 0)
             domains = result.get("domain") or []
             if domains:
-                # This is authoritative for the account; use it for subsequent calls.
                 self.base_url = str(domains[0]).rstrip("/")
 
             if not self._token:
                 raise Exception(f"No token in login response: {result}")
 
-            self._session.headers["token"] = self._token
+            self._headers["token"] = self._token
             _LOGGER.info("Successfully logged in to Aiper API (base_url=%s)", self.base_url)
 
-            # Pre-fetch OpenID token for AWS IoT
-            self._get_openid_token()
-
+            await self.get_openid_token()
             return True
 
-        except requests.RequestException as err:
+        except aiohttp.ClientError as err:
             _LOGGER.error("Login request failed: %s", err)
-            raise Exception(f"Login request failed: {err}")
+            raise Exception(f"Login request failed: {err}") from err
 
     def _zone_id_for_sn(self, sn: str) -> str | None:
         """Return the best-known zoneId for a device.
@@ -333,59 +384,44 @@ class AiperApi:
         if isinstance(zid, str) and zid:
             return zid
         # Fall back to whatever is already configured on the session.
-        header_zid = self._session.headers.get("zoneId")
+        header_zid = self._headers.get("zoneId")
         return header_zid if isinstance(header_zid, str) and header_zid else None
 
-    def _call_with_zoneid(self, sn: str, fn: Callable[[], Any]) -> Any:
-        """Invoke `fn` while temporarily setting the zoneId header for `sn`."""
+
+    async def _call_with_zoneid(self, sn: str, fn: Callable[[], Awaitable[Any]]) -> Any:
+        """Invoke async `fn` while temporarily setting the zoneId header for `sn`."""
         zid = self._zone_id_for_sn(sn)
-        prev_value = self._session.headers.get("zoneId")
+        prev_value = self._headers.get("zoneId")
         prev = prev_value if isinstance(prev_value, str) else None
         if zid:
-            self._session.headers["zoneId"] = zid
+            self._headers["zoneId"] = zid
         try:
-            return fn()
+            return await fn()
         finally:
             if prev is not None:
-                self._session.headers["zoneId"] = prev
+                self._headers["zoneId"] = prev
             else:
-                # Remove if it did not exist before.
-                self._session.headers.pop("zoneId", None)
+                self._headers.pop("zoneId", None)
     
-    def _verify_token(self) -> bool:
-        """Verify the authentication token is valid."""
-        try:
-            payload = self._call_encrypted("GET", "/users/verificationToken", None)
-            if self._is_success(payload):
-                _LOGGER.debug("Token verification successful")
-                return True
-            # Do not log full payload because it may include authentication details.
-            try:
-                code = payload.get("code") if isinstance(payload, dict) else None
-                msg = None
-                if isinstance(payload, dict):
-                    msg = payload.get("msg") or payload.get("message")
-                _LOGGER.warning("Token verification returned (code=%s, message=%s)", code, msg)
-            except Exception:
-                _LOGGER.warning("Token verification returned an unexpected response")
-            return False
-        except Exception as err:
-            _LOGGER.warning("Token verification failed: %s", err)
-            return False
     
-    def refresh_token(self) -> bool:
+
+    async def refresh_token(self) -> bool:
         """Refresh the authentication token."""
         try:
-            payload = self._call_encrypted("POST", "/users/token/refresh", {})
+            payload = await self._call_encrypted(
+                "POST",
+                "/users/token/refresh",
+                {},
+                retry_login=False,
+            )
             if self._is_success(payload):
                 result = payload.get("data", {}) or {}
                 new_token = result.get("token")
                 if isinstance(new_token, str) and new_token:
                     self._token = new_token
-                    self._session.headers["token"] = self._token
+                    self._headers["token"] = self._token
                     _LOGGER.info("Token refreshed successfully")
                     return True
-            # Do not log full payload because it may include credentials/tokens.
             try:
                 code = payload.get("code") if isinstance(payload, dict) else None
                 msg = None
@@ -399,12 +435,12 @@ class AiperApi:
             _LOGGER.error("Token refresh error: %s", err)
             return False
 
-    def _get_openid_token(self) -> None:
+
+    async def get_openid_token(self) -> None:
         """Fetch Cognito Identity/OpenID data used for AWS IoT MQTT."""
         try:
-            payload = self._call_encrypted("POST", "/users/getOpenIdToken", {})
+            payload = await self._call_encrypted("POST", "/users/getOpenIdToken", {})
             if not self._is_success(payload):
-                # Do not log full payload because it may contain credentials/tokens.
                 try:
                     code = payload.get("code") if isinstance(payload, dict) else None
                     msg = None
@@ -423,39 +459,32 @@ class AiperApi:
             self._aws_region = data.get("region")
             self._openid_token = data.get("token")
 
-            # tokenDuration is in seconds
             dur = data.get("tokenDuration")
             if dur:
                 self._openid_token_exp = time.time() + float(dur)
 
             _LOGGER.debug(
                 "Got OpenID token data identity_id=%s pool_id=%s iot_endpoint=%s",
-                (self._identity_id[:8] + "…") if isinstance(self._identity_id, str) else None,
-                (self._identity_pool_id[:8] + "…") if isinstance(self._identity_pool_id, str) else None,
+                (self._identity_id[:8] + "...") if isinstance(self._identity_id, str) else None,
+                (self._identity_pool_id[:8] + "...") if isinstance(self._identity_pool_id, str) else None,
                 self._iot_endpoint,
             )
 
         except Exception as err:
             _LOGGER.warning("Failed to get OpenID token data: %s", err)
 
-    def _get_aws_credentials(self) -> dict[str, Any] | None:
-        """Exchange the OpenID token for temporary AWS credentials.
 
-        Uses Cognito Identity GetCredentialsForIdentity with Logins set to
-        cognito-identity.amazonaws.com.
-        """
-
+    async def get_aws_credentials(self) -> dict[str, Any] | None:
+        """Exchange the OpenID token for temporary AWS credentials asynchronously."""
         if not self._identity_id or not self._openid_token:
             return None
 
-        # Refresh OpenID token if close to expiry (or missing expiry info)
         if self._openid_token_exp and (self._openid_token_exp - time.time()) < 120:
-            self._get_openid_token()
+            await self.get_openid_token()
 
         if self._aws_credentials_exp and (self._aws_credentials_exp - time.time()) > 120:
             return self._aws_credentials
 
-        # Infer region from the IoT endpoint, e.g. "...iot.eu-central-1.amazonaws.com"
         region = self._aws_region
         if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
             try:
@@ -474,9 +503,8 @@ class AiperApi:
             "Logins": {"cognito-identity.amazonaws.com": self._openid_token},
         }
 
-        resp = requests.post(url, headers=headers, json=body, timeout=30)
-        resp.raise_for_status()
-        out = resp.json()
+        _status, text = await self._request_with_backoff("POST", url, headers=headers, json_body=body, timeout=30)
+        out = json.loads(text)
 
         creds = out.get("Credentials") or {}
         if not creds.get("AccessKeyId"):
@@ -484,14 +512,14 @@ class AiperApi:
             return None
 
         self._aws_credentials = creds
-        # Expiration may be ISO8601 string; keep a conservative cache window.
-        self._aws_credentials_exp = time.time() + 3300  # ~55 minutes
+        self._aws_credentials_exp = time.time() + 3300
         return creds
 
-    def get_devices(self) -> list[dict]:
-        """Get list of devices from API."""
+
+    async def get_devices(self) -> list[dict]:
+        """Get list of devices from API without blocking the event loop."""
         try:
-            payload = self._call_encrypted("POST", "/equipment/getEquipment", {})
+            payload = await self._call_encrypted("POST", "/equipment/getEquipment", {})
             _LOGGER.debug("Get devices response: %s", payload)
 
             if not self._is_success(payload):
@@ -512,15 +540,16 @@ class AiperApi:
                     _LOGGER.debug("Found device: %s (%s)", device.get("name", "Unknown"), sn)
 
             return devices
-            
-        except requests.RequestException as err:
+
+        except aiohttp.ClientError as err:
             _LOGGER.error("Failed to get devices: %s", err)
             return []
 
-    def get_device_info(self, sn: str) -> dict | None:
-        """Get detailed info for a specific device."""
+
+    async def get_device_info(self, sn: str) -> dict | None:
+        """Get detailed info for a specific device without blocking the event loop."""
         try:
-            payload = self._call_encrypted("POST", "/equipment/getEquipmentInfo", {"sn": sn})
+            payload = await self._call_encrypted("POST", "/equipment/getEquipmentInfo", {"sn": sn})
             _LOGGER.info("Device info for %s: %s", sn, payload)
 
             if not self._is_success(payload):
@@ -531,98 +560,63 @@ class AiperApi:
                 out = dict(data)
                 out["_payload"] = payload
                 return out
-            # Some regions return a non-dict under `data` (e.g., list/scalar).
             return {"data": data, "_payload": payload}
 
-        except requests.RequestException as err:
+        except aiohttp.ClientError as err:
             _LOGGER.error("Failed to get device info for %s: %s", sn, err)
             return None
 
-    def get_device_status(self, sn: str) -> dict | None:
-        """Get online status for a device."""
+
+    async def get_device_status(self, sn: str) -> dict | None:
+        """Get online status for a device without blocking the event loop."""
         try:
-            payload = self._call_encrypted("POST", "/equipment/checkEquipmentOnlineStatus", {"sn": sn})
+            payload = await self._call_encrypted("POST", "/equipment/checkEquipmentOnlineStatus", {"sn": sn})
             _LOGGER.info("Device status for %s: %s", sn, payload)
 
             if self._is_success(payload):
                 return payload.get("data")
             return None
-            
-        except requests.RequestException as err:
+
+        except aiohttp.ClientError as err:
             _LOGGER.error("Failed to get status for %s: %s", sn, err)
             return None
     
-    def get_cleaning_history(self, sn: str) -> Any:
-        """Get cleaning history/totals for a device.
+    def _cleaning_history_bodies(self, sn: str) -> list[dict[str, Any]]:
+        """Return the current request body for the cleaning-history endpoint."""
+        return [{"sn": sn, "pageNum": 1, "pageSize": 20}]
 
-        We return the full decrypted payload because some regions/firmwares
-        place totals (counts/time) at the root level instead of under `data`.
-        """
 
-        def _do(body: dict[str, Any]) -> Any:
-            payload = self._call_encrypted("POST", "/swimming/v2/getCleanTimeBySn", body)
+    async def get_cleaning_history(self, sn: str) -> Any:
+        """Get cleaning history/totals for a device without blocking the event loop."""
+
+        async def _do(body: dict[str, Any]) -> Any:
+            payload = await self._call_encrypted("POST", "/swimming/v2/getCleanTimeBySn", body)
             if self._is_success(payload):
                 return payload
             return None
 
         try:
-            # Try a couple of common pagination payload shapes.
-            data = self._call_with_zoneid(sn, lambda: _do({"sn": sn}))
-            if not data:
-                data = self._call_with_zoneid(sn, lambda: _do({"sn": sn, "pageNo": 1, "pageSize": 20}))
-            if not data:
-                data = self._call_with_zoneid(sn, lambda: _do({"sn": sn, "pageNum": 1, "pageSize": 20}))
-            if not data:
-                data = self._call_with_zoneid(sn, lambda: _do({"sn": sn, "page": 1, "size": 20}))
-            return data or {}
+            for body in self._cleaning_history_bodies(sn):
+                data = await self._call_with_zoneid(sn, lambda body=body: _do(body))
+                if data:
+                    return data
+            return {}
 
         except Exception as err:
             _LOGGER.error("Failed to get cleaning history: %s", err)
             return {}
 
-    def get_consumables(self, sn: str) -> Any:
-        """Get consumable status (filter, brush, etc.).
 
-        Similar to other Aiper endpoints, parameter names vary by region.
-        We try multiple request shapes and return the full decrypted payload.
-        """
-
-        def _do(body: dict) -> Any:
-            payload = self._call_encrypted("POST", "/poolRobot/getConsumableList", body)
-            if self._is_success(payload):
-                return payload
-            return None
+    async def get_consumables(self, sn: str) -> Any:
+        """Get consumable status without blocking the event loop."""
 
         try:
-            dev = self._devices.get(sn) or {}
-            equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id") or dev.get("eid")
-
-            bodies: list[dict[str, Any]] = []
-            # Common shapes
-            bodies.extend([
-                {"sn": sn},
-                {"sn": sn, "type": 0},
-                {"sn": sn, "type": 1},
-                {"equipmentSn": sn},
-                {"equipmentSn": sn, "type": 0},
-                {"equipmentSn": sn, "type": 1},
-                {"serialNumber": sn},
-            ])
-
-            if equip_id is not None:
-                bodies[:0] = [
-                    {"equipmentId": equip_id},
-                    {"equipmentId": equip_id, "type": 0},
-                    {"equipmentId": equip_id, "type": 1},
-                    {"id": equip_id},
-                    {"deviceId": equip_id},
-                ]
-
-            # Try each body until we get a non-empty payload
-            for body in bodies:
-                data = self._call_with_zoneid(sn, partial(_do, body))
-                if data:
-                    return data
+            payload = await self._call_with_zoneid(
+                sn,
+                lambda: self._call_encrypted("POST", "/poolRobot/getConsumableList", {"sn": sn}),
+            )
+            if self._is_success(payload):
+                return payload
 
             return None
 
@@ -631,35 +625,44 @@ class AiperApi:
             return None
 
     # --- Clean path preference (REST) ---
-    def query_clean_path_setting(self, sn: str) -> int | None:
-        """Query the clean-path preference.
 
-        We observe multiple backend stacks depending on region/device family.
-        For EU Scuba_X1, /equipmentCleanPathSetting/* endpoints exist while
-        older /network/* and /swimming/v2/* endpoints may return 404.
+    async def query_clean_path_setting(self, sn: str) -> int | None:
+        """Query the clean-path preference without blocking the event loop."""
+        if self._device_family_for_sn(sn) == DeviceFamily.SURFER:
+            try:
+                payload = await self._call_with_zoneid(
+                    sn,
+                    lambda: self._call_encrypted(
+                        "POST",
+                        "/equipmentCleanPathSetting/getCleanPathSetting",
+                        {"sn": sn},
+                    ),
+                )
+            except Exception as err:
+                _LOGGER.debug("Surfer clean path query failed: %s", err)
+                return None
 
-        Returns:
-            int | None: preference value (0/1 typical), or None if not available.
-        """
+            if payload and self._is_success(payload):
+                return self._clean_path_value_from_payload(payload)
+            return None
 
         dev = self._devices.get(sn) or {}
         equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id")
 
-        # Ensure we have an equipment id (some accounts/devices only populate it after discovery).
         if equip_id is None:
             try:
-                self.get_devices()
+                await self.get_devices()
             except Exception:
                 pass
             dev = self._devices.get(sn) or {}
             equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id")
 
+        # Async mirror of the legacy non-Surfer clean-path discovery code above.
+        # Keep until Scuba verification proves the current backend contract.
         base_paths = [
-            # Newer backend (EU)
             "/equipmentCleanPathSetting/getCleanPathSetting",
             "/equipmentCleanPathSetting/getCleanPathSettingBySn",
             "/equipmentCleanPathSetting/queryCleanPathSetting",
-            # Older backends
             "/network/clean_path_setting",
             "/network/cleanPathSetting",
             "/swimming/v2/queryCleanPathSetting",
@@ -671,13 +674,11 @@ class AiperApi:
         for p in base_paths:
             if p not in candidate_paths:
                 candidate_paths.append(p)
-        # Some environments mount APIs under /surfer
         for p in list(candidate_paths):
             sp = f"/surfer{p}" if not p.startswith("/surfer/") else p
             if sp not in candidate_paths:
                 candidate_paths.append(sp)
 
-        # Try a few common payload shapes.
         bodies: list[dict[str, Any]] = [{"sn": sn}]
         if equip_id is not None:
             bodies.insert(0, {"sn": sn, "id": equip_id})
@@ -688,85 +689,81 @@ class AiperApi:
             for body in bodies:
                 payload = None
                 try:
-                    payload = self._call_with_zoneid(sn, partial(self._call_encrypted, "POST", path, body))
+                    payload = await self._call_with_zoneid(
+                        sn,
+                        lambda path=path, body=body: self._call_encrypted("POST", path, body),
+                    )
                 except Exception as err:
                     _LOGGER.debug("Clean path query encrypted call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     try:
-                        payload = self._call_with_zoneid(sn, partial(self._call_plain, "POST", path, body))
+                        payload = await self._call_with_zoneid(
+                            sn,
+                            lambda path=path, body=body: self._call_plain("POST", path, body),
+                        )
                     except Exception as err:
                         _LOGGER.debug("Clean path query plain call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     continue
 
-                data = payload.get("data")
-                val = None
-                if isinstance(data, dict):
-                    for k in ("cleanPath", "cleanPathSetting", "clean_path_setting", "path", "value"):
-                        if k in data:
-                            val = data.get(k)
-                            break
-                # Some backends may return the value at the top level
-                if val is None:
-                    for k in ("cleanPath", "cleanPathSetting", "clean_path_setting"):
-                        if isinstance(payload.get(k), (int, str)):
-                            val = payload.get(k)
-                            break
-
-                # Normalize to numeric values. Some firmwares return labels.
-                if isinstance(val, str):
-                    s = val.strip()
-                    if s.lstrip("-").isdigit():
-                        try:
-                            val = int(s)
-                        except Exception:
-                            val = None
-
-                if isinstance(val, int):
-                    # App treats -1 as default.
-                    return 0 if val == -1 else int(val)
-
-                if isinstance(val, str):
-                    # Labels like "S-shaped" / "Adaptive"
-                    norm = " ".join(val.lower().replace("_", " ").replace("-", " ").split())
-                    if "adaptive" in norm:
-                        return 1
-                    if "shape" in norm or norm.startswith("s ") or norm == "s":
-                        return 0
+                val = self._clean_path_value_from_payload(payload)
+                if val is not None:
+                    return val
 
         return None
 
-    def update_clean_path_setting(self, sn: str, value: int) -> bool:
-        """Update clean-path preference and apply it to the device.
 
-        On some models (e.g. Scuba_X1), updating the cloud preference alone may
-        not immediately affect device behavior; the mobile app appears to also
-        send a downChan (MQTT) command to apply the setting. We therefore:
+    async def update_clean_path_setting(self, sn: str, value: int) -> bool:
+        """Update clean-path preference and apply it to the device asynchronously."""
+        if self._device_family_for_sn(sn) == DeviceFamily.SURFER:
+            rest_ok = False
+            try:
+                payload = await self._call_with_zoneid(
+                    sn,
+                    lambda: self._call_encrypted(
+                        "POST",
+                        "/equipmentCleanPathSetting/updateCleanPathSetting",
+                        {"sn": sn, "cleanPath": int(value)},
+                    ),
+                )
+                rest_ok = bool(payload and self._is_success(payload))
+            except Exception as err:
+                _LOGGER.debug("Surfer clean path REST update failed: %s", err)
 
-          1) Persist preference via REST (best-effort across known stacks)
-          2) If MQTT is connected, publish downChan variants (structured + AT)
-          3) Nudge shadow desired so HA converges quickly
-        """
+            mqtt_ok = False
+            if self.is_mqtt_connected():
+                try:
+                    # Surfer S2 accepts AT+AUTO=<value>. Other AT and structured
+                    # downChan variants were rejected or unacknowledged in live probes.
+                    mqtt_ok = await self.send_machine_at(sn, f"AT+AUTO={int(value)}") is True
+                except Exception as err:
+                    _LOGGER.debug("Surfer clean path AT update failed: %s", err)
 
+            try:
+                await self.request_shadow(sn)
+            except Exception:
+                pass
+
+            return bool(rest_ok or mqtt_ok)
+
+        # Async mirror of the legacy non-Surfer clean-path control code above.
+        # Keep until Scuba verification proves the current backend contract.
         dev = self._devices.get(sn) or {}
         equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id")
 
-        # Ensure we have an equipment id (some accounts/devices only populate it after discovery).
         if equip_id is None:
             try:
-                self.get_devices()
+                await self.get_devices()
             except Exception:
                 pass
             dev = self._devices.get(sn) or {}
             equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id")
 
         base_paths = [
-            # Newer backend (EU)
             "/equipmentCleanPathSetting/updateCleanPathSetting",
             "/equipmentCleanPathSetting/updateCleanPathSettingBySn",
-            # Older backends
             "/network/clean_path_setting",
             "/network/cleanPathSetting",
             "/swimming/v2/updateCleanPathSetting",
@@ -782,11 +779,8 @@ class AiperApi:
             if sp not in candidate_paths:
                 candidate_paths.append(sp)
 
-        # Try multiple key variants; some backends expect cleanPathSetting.
         key_variants = ("cleanPath", "cleanPathSetting", "clean_path_setting")
-        base_bodies: list[dict[str, Any]] = []
-        for k in key_variants:
-            base_bodies.append({"sn": sn, k: int(value)})
+        base_bodies: list[dict[str, Any]] = [{"sn": sn, k: int(value)} for k in key_variants]
 
         bodies: list[dict[str, Any]] = []
         if equip_id is not None:
@@ -802,13 +796,19 @@ class AiperApi:
             for body in bodies:
                 payload = None
                 try:
-                    payload = self._call_with_zoneid(sn, partial(self._call_encrypted, "POST", path, body))
+                    payload = await self._call_with_zoneid(
+                        sn,
+                        lambda path=path, body=body: self._call_encrypted("POST", path, body),
+                    )
                 except Exception as err:
                     _LOGGER.debug("Clean path update encrypted call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     try:
-                        payload = self._call_with_zoneid(sn, partial(self._call_plain, "POST", path, body))
+                        payload = await self._call_with_zoneid(
+                            sn,
+                            lambda path=path, body=body: self._call_plain("POST", path, body),
+                        )
                     except Exception as err:
                         _LOGGER.debug("Clean path update plain call failed (%s): %s", path, err)
 
@@ -828,7 +828,6 @@ class AiperApi:
 
         mqtt_published = False
         if self.is_mqtt_connected():
-            # 2a) Structured downChan variants (best-effort)
             machine_payloads = (
                 {"cleanPath": int(value)},
                 {"cleanPathSetting": int(value)},
@@ -839,13 +838,12 @@ class AiperApi:
             )
             for mp in machine_payloads:
                 try:
-                    if self.send_command(sn, "Machine", mp):
+                    if await self.send_command(sn, "Machine", mp):
                         mqtt_published = True
                         _LOGGER.debug("Clean path downChan published: %s", mp)
                 except Exception as err:
                     _LOGGER.debug("Clean path downChan publish failed (%s): %s", mp, err)
 
-            # 2b) AT command variants with ack observation (stop early on +OK)
             for at_cmd in (
                 f"AT+AUTO={int(value)}",
                 f"AUTO {int(value)}",
@@ -854,7 +852,7 @@ class AiperApi:
                 f"AT+SETPATH={int(value)}",
             ):
                 try:
-                    res = self.send_machine_at(sn, at_cmd)
+                    res = await self.send_machine_at(sn, at_cmd)
                     if res is True:
                         mqtt_published = True
                         _LOGGER.debug("Clean path AT confirmed: %s", at_cmd)
@@ -863,16 +861,14 @@ class AiperApi:
                         mqtt_published = True
                         _LOGGER.debug("Clean path AT rejected: %s", at_cmd)
                         continue
-                    # None: published but no ack observed
                     mqtt_published = True
                     _LOGGER.debug("Clean path AT published (no ack): %s", at_cmd)
                 except Exception as err:
                     _LOGGER.debug("Clean path AT failed (%s): %s", at_cmd, err)
 
-        shadow_ok = False
         try:
             shadow_ok = bool(
-                self.publish_shadow_update(
+                await self.publish_shadow_update(
                     sn,
                     {"Machine": {"cleanPath": int(value), "cleanPathSetting": int(value), "clean_path_setting": int(value)}},
                 )
@@ -881,27 +877,26 @@ class AiperApi:
             shadow_ok = False
 
         try:
-            self.request_shadow(sn)
+            await self.request_shadow(sn)
         except Exception:
             pass
 
         return bool(rest_ok or mqtt_published or shadow_ok)
 
-    def connect_mqtt(self) -> bool:
+
+    async def connect_mqtt(self) -> bool:
         """Connect to AWS IoT MQTT broker."""
         if not self._identity_id or not self._iot_endpoint:
             _LOGGER.error("No IoT identity/endpoint available")
             return False
-            
+
         try:
-            creds = self._get_aws_credentials()
+            self._async_loop = asyncio.get_running_loop()
+            creds = await self.get_aws_credentials()
             if not creds:
                 _LOGGER.error("Unable to obtain AWS credentials for MQTT")
                 return False
-            
-            # Aiper's AWS IoT policy appears to bind Connect permission to the
-            # Cognito identity id. Prefixing or rewriting it causes AWS IoT to
-            # close the MQTT connection during CONNECT.
+
             client_id = self._identity_id
             region = self._aws_region
             if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
@@ -921,14 +916,14 @@ class AiperApi:
                 operation_timeout=5.0,
             )
 
-            if self._mqtt_client.connect():
+            if await self._mqtt_client.async_connect():
                 self._mqtt_connected = True
                 _LOGGER.info("Connected to AWS IoT MQTT using AWS IoT Device SDK v2")
                 return True
-            
+
             self._mqtt_connected = False
             return False
-            
+
         except Exception as err:
             _LOGGER.error("MQTT connection failed: %s", err)
             self._mqtt_connected = False
@@ -942,13 +937,14 @@ class AiperApi:
         return bool(self._mqtt_connected and self._mqtt_client and self._mqtt_client.is_connected())
 
 
-    def request_shadow(self, sn: str) -> bool:
+
+    async def request_shadow(self, sn: str) -> bool:
         """Request the current AWS IoT thing shadow."""
         if not self.is_mqtt_connected():
             return False
         try:
             topic = TOPIC_SHADOW_GET_REQUEST.format(sn=sn)
-            if not self._mqtt_client.publish(topic, "", 1):
+            if not await self._mqtt_client.async_publish(topic, "", 1):
                 return False
             _LOGGER.debug("Published shadow get request to %s", topic)
             return True
@@ -957,36 +953,21 @@ class AiperApi:
             return False
 
 
-    def publish_shadow_update(self, sn: str, desired: dict[str, Any]) -> bool:
-        """Backward-compatible alias for publishing a shadow desired-state update.
 
-        Earlier builds referenced `publish_shadow_update`; the implementation is
-        provided by `publish_shadow_desired`.
-        """
-        return self.publish_shadow_desired(sn, desired)
+    async def publish_shadow_update(self, sn: str, desired: dict[str, Any]) -> bool:
+        """Backward-compatible alias for desired-state publishing."""
+        return await self.publish_shadow_desired(sn, desired)
 
 
-    def publish_shadow_desired(self, sn: str, desired: dict[str, Any]) -> bool:
-        """Publish a desired-state update to the AWS IoT device shadow.
-
-        Some Aiper models appear to act on desired-state deltas rather than
-        processing app/downChan packets. We therefore publish desired-state
-        updates as an additional control path.
-
-        Parameters
-        ----------
-        sn: str
-            Device serial number
-        desired: dict
-            Desired state fragment, e.g. {"Machine": {"mode": 0}}
-        """
+    async def publish_shadow_desired(self, sn: str, desired: dict[str, Any]) -> bool:
+        """Publish a desired-state update to the AWS IoT device shadow."""
         if not self.is_mqtt_connected():
             return False
         try:
             topic = TOPIC_SHADOW_UPDATE.format(sn=sn)
             payload = {"state": {"desired": desired}}
             message = json.dumps(payload, separators=(",", ":"))
-            if not self._mqtt_client.publish(topic, message, 1):
+            if not await self._mqtt_client.async_publish(topic, message, 1):
                 return False
             _LOGGER.debug("Published shadow update to %s: %s", topic, message)
             return True
@@ -994,97 +975,92 @@ class AiperApi:
             _LOGGER.debug("Failed to publish shadow update for %s: %s", sn, err)
             return False
 
-    def subscribe_device(self, sn: str, callback: Callable[[dict], None]) -> bool:
-        """Subscribe to device shadow updates."""
-        if not self.is_mqtt_connected():
-            _LOGGER.warning("MQTT not connected, cannot subscribe")
-            return False
-            
+    def _register_shadow_callback(self, sn: str, callback: Callable[..., None]) -> None:
+        """Register a callback for normalized MQTT shadow/report payloads."""
         with self._lock:
             if sn not in self._shadow_callbacks:
                 self._shadow_callbacks[sn] = []
             self._shadow_callbacks[sn].append(callback)
-        
-        # Determine topic based on device type
+
+    def _subscription_topics_for_sn(self, sn: str) -> tuple[str, ...]:
+        """Return MQTT topics to subscribe for a device."""
         is_x9 = any(sn.upper().startswith(prefix) for prefix in X9_SERIES_PREFIXES)
         report_topic = TOPIC_SHADOW_REPORT_X9 if is_x9 else TOPIC_SHADOW_REPORT
-        
-        def on_message(topic: str, payload_bytes: bytes) -> None:
-            try:
-                payload = self._decrypt(payload_bytes)
-                data = json.loads(payload)
+        return (
+            report_topic.format(sn=sn),
+            TOPIC_READ.format(sn=sn),
+            TOPIC_SHADOW_GET.format(sn=sn),
+            TOPIC_SHADOW_UPDATE_ACCEPTED.format(sn=sn),
+            TOPIC_SHADOW_UPDATE_DELTA.format(sn=sn),
+            TOPIC_SHADOW_UPDATE_DOCUMENTS.format(sn=sn),
+            TOPIC_SHADOW_REPORT_X9.format(sn=sn),
+        )
 
-                # Track the device's reported timezone string (e.g. "UTC+3")
-                # so that we can include it when sending downlink commands.
-                if (
-                    isinstance(data, dict)
-                    and isinstance(data.get("data"), dict)
-                    and isinstance(data["data"].get("sn"), str)
-                    and isinstance(data["data"].get("timeZone"), str)
-                ):
-                    self._last_timezone_by_sn[data["data"]["sn"]] = data["data"]["timeZone"]
-
-                # Capture acknowledgements for downlink AT commands.
-                # Example upChan payload:
-                #   {"type":"Machine","data":{"sn":"...","timeZone":"UTC+3","ack":"+OK\r\n"}, ...}
-                if (
-                    isinstance(data, dict)
-                    and data.get("type") == "Machine"
-                    and isinstance(data.get("data"), dict)
-                    and isinstance(data["data"].get("ack"), str)
-                ):
-                    self._record_ack(sn, data["data"]["ack"])
-
-                # Always attach the serial number so downstream handlers can
-                # process updates even if they were registered with a
-                # single-argument callback.
-                if isinstance(data, dict) and "_sn" not in data:
-                    data["_sn"] = sn
-
-                # Attach the MQTT topic so downstream handlers can distinguish
-                # between shadow/report, shadow/update/delta, and documents.
-                if isinstance(data, dict) and "_topic" not in data:
-                    data["_topic"] = topic
-
-                if self.mqtt_debug:
-                    _LOGGER.debug("MQTT message topic=%s payload=%s", topic, payload[:800])
-                
-                with self._lock:
-                    for cb in self._shadow_callbacks.get(sn, []):
-                        try:
-                            # Support both callback styles:
-                            #   cb(sn, data)
-                            #   cb(data)
-                            try:
-                                cb(sn, data)
-                            except TypeError:
-                                cb(data)
-                        except Exception as err:
-                            _LOGGER.error("Callback error: %s", err)
-                            
-            except Exception as err:
-                _LOGGER.error("Failed to process message: %s", err)
-        
+    def _handle_device_message(self, sn: str, topic: str, payload_bytes: bytes) -> None:
+        """Normalize one MQTT payload and dispatch it to registered callbacks."""
         try:
-            # Subscribe to shadow report topic
-            topic = report_topic.format(sn=sn)
-            topics = (
-                topic,
-                TOPIC_READ.format(sn=sn),
-                TOPIC_SHADOW_GET.format(sn=sn),
-                TOPIC_SHADOW_UPDATE_ACCEPTED.format(sn=sn),
-                TOPIC_SHADOW_UPDATE_DELTA.format(sn=sn),
-                TOPIC_SHADOW_UPDATE_DOCUMENTS.format(sn=sn),
-                # Some models publish to app/report.
-                TOPIC_SHADOW_REPORT_X9.format(sn=sn),
-            )
-            for sub_topic in topics:
-                if not self._mqtt_client.subscribe(sub_topic, on_message, 1):
+            payload = self._decrypt(payload_bytes)
+            data = json.loads(payload)
+
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("data"), dict)
+                and isinstance(data["data"].get("sn"), str)
+                and isinstance(data["data"].get("timeZone"), str)
+            ):
+                self._last_timezone_by_sn[data["data"]["sn"]] = data["data"]["timeZone"]
+
+            if (
+                isinstance(data, dict)
+                and data.get("type") == "Machine"
+                and isinstance(data.get("data"), dict)
+                and isinstance(data["data"].get("ack"), str)
+            ):
+                self._record_ack(sn, data["data"]["ack"])
+
+            if isinstance(data, dict) and "_sn" not in data:
+                data["_sn"] = sn
+
+            if isinstance(data, dict) and "_topic" not in data:
+                data["_topic"] = topic
+
+            if self.mqtt_debug:
+                _LOGGER.debug("MQTT message topic=%s payload=%s", topic, payload[:800])
+
+            with self._lock:
+                for cb in self._shadow_callbacks.get(sn, []):
+                    try:
+                        try:
+                            cb(sn, data)
+                        except TypeError:
+                            cb(data)
+                    except Exception as err:
+                        _LOGGER.error("Callback error: %s", err)
+
+        except Exception as err:
+            _LOGGER.error("Failed to process message: %s", err)
+
+
+    async def subscribe_device(self, sn: str, callback: Callable[..., None]) -> bool:
+        """Subscribe to device shadow updates."""
+        if not self.is_mqtt_connected():
+            _LOGGER.warning("MQTT not connected, cannot subscribe")
+            return False
+
+        self._async_loop = asyncio.get_running_loop()
+        self._register_shadow_callback(sn, callback)
+
+        def on_message(topic: str, payload_bytes: bytes) -> None:
+            self._handle_device_message(sn, topic, payload_bytes)
+
+        try:
+            for sub_topic in self._subscription_topics_for_sn(sn):
+                if not await self._mqtt_client.async_subscribe(sub_topic, on_message, 1):
                     return False
                 _LOGGER.debug("Subscribed to %s", sub_topic)
-            
+
             return True
-            
+
         except Exception as err:
             _LOGGER.error("Failed to subscribe to %s: %s", sn, err)
             return False
@@ -1118,48 +1094,66 @@ class AiperApi:
         """Record an AT command acknowledgement received on upChan."""
         with self._ack_lock:
             self._ack_fifo[sn].append(ack)
-            self._ack_events[sn].set()
+        if self._async_loop is not None and sn in self._async_ack_events:
+            self._async_loop.call_soon_threadsafe(self._async_ack_events[sn].set)
 
     def _clear_ack_fifo(self, sn: str) -> None:
         with self._ack_lock:
             self._ack_fifo[sn].clear()
-            self._ack_events[sn].clear()
+        event = self._async_ack_events.get(sn)
+        if event is not None:
+            event.clear()
 
-    def _wait_for_ack(self, sn: str, timeout: float = 4.0) -> str | None:
-        """Wait for the next ack for this device SN.
 
-        Returns the ack string (e.g. "+OK\r\n" / "+ERROR\r\n") or None on timeout.
-        """
-        ev = self._ack_events[sn]
-        if not ev.wait(timeout=timeout):
+    def _async_ack_event(self, sn: str) -> asyncio.Event:
+        event = self._async_ack_events.get(sn)
+        if event is None:
+            event = asyncio.Event()
+            self._async_ack_events[sn] = event
+        return event
+
+    async def _wait_for_ack(self, sn: str, timeout: float = 4.0) -> str | None:
+        """Wait for the next ack for this device SN without blocking."""
+        with self._ack_lock:
+            if self._ack_fifo[sn]:
+                return self._ack_fifo[sn].popleft()
+
+        event = self._async_ack_event(sn)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except TimeoutError:
             return None
+
         with self._ack_lock:
             if not self._ack_fifo[sn]:
                 return None
             ack = self._ack_fifo[sn].popleft()
-            # If more acks remain, keep the event set; otherwise clear.
             if not self._ack_fifo[sn]:
-                ev.clear()
+                event.clear()
             return ack
 
-    def send_machine_at(self, sn: str, at_cmd: str, timeout: float = 4.0) -> bool | None:
-        """Send an AT command via downChan and wait for an upChan ack.
 
-        Returns:
-          True  -> ack indicates OK
-          False -> ack indicates ERROR
-          None  -> no ack observed (published, but cannot confirm)
-        """
+    def _cmd_lock(self, sn: str) -> asyncio.Lock:
+        lock = self._cmd_locks.get(sn)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cmd_locks[sn] = lock
+        return lock
+
+    async def send_machine_at(self, sn: str, at_cmd: str, timeout: float = 4.0) -> bool | None:
+        """Send an AT command via downChan and wait for an upChan ack."""
+        self._async_loop = asyncio.get_running_loop()
         tz = self._timezone_string_for_sn(sn)
         payload = {"sn": sn, "timeZone": tz, "cmd": at_cmd}
 
-        with self._cmd_locks[sn]:
+        async with self._cmd_lock(sn):
+            self._async_ack_event(sn)
             self._clear_ack_fifo(sn)
-            published = self.send_command(sn, "Machine", payload)
+            published = await self.send_command(sn, "Machine", payload)
             if not published:
                 return None
 
-            ack = self._wait_for_ack(sn, timeout=timeout)
+            ack = await self._wait_for_ack(sn, timeout=timeout)
             if ack is None:
                 return None
 
@@ -1170,26 +1164,13 @@ class AiperApi:
                 return False
             return None
 
-    def send_command(self, sn: str, cmd_type: str, data: dict | None = None) -> bool:
-        """Send a command to the device.
 
-        IMPORTANT: The device validates a CRC16 checksum over a *compact* JSON
-        rendering of the `data` object (no spaces). Using Python's default
-        `json.dumps()` (which inserts spaces) yields a different checksum and
-        commands are silently ignored.
-
-        We therefore:
-          1) Serialize `data` with `separators=(",", ":")`
-          2) Compute CRC16 over that exact string
-          3) Serialize the full payload with the same compact separators
-        """
+    async def send_command(self, sn: str, cmd_type: str, data: dict | None = None) -> bool:
+        """Send a command to the device."""
         is_x9 = any(sn.upper().startswith(prefix) for prefix in X9_SERIES_PREFIXES)
 
         data_obj: dict[str, Any] = dict(data or {})
 
-        # Most devices include `sn` and `timeZone` inside the `data` object.
-        # Including them (and keeping a stable key order) improves interoperability
-        # and matches what we see in `shadow/report` payloads.
         if not is_x9:
             cmd_sn = data_obj.get("sn") if isinstance(data_obj.get("sn"), str) else sn
             tz = (
@@ -1211,40 +1192,28 @@ class AiperApi:
             data_obj = ordered
 
         if is_x9:
-            # X9 format: {"Machine": {...}, "chksum": 12345}
             payload: dict[str, Any] = {cmd_type: data_obj}
         else:
-            # Standard format: {"type": "Machine", "data": {...}, "chksum": 12345}
             payload = {
                 "type": cmd_type,
                 "data": data_obj,
             }
 
-        # Include a result field to mirror telemetry...
         if not is_x9:
             payload["res"] = 0
 
-        # Compute checksum over compact JSON of the *data* object.
         data_json = json.dumps(data_obj, separators=(",", ":"))
         payload["chksum"] = self._crc16(data_json)
 
-        # Send compact JSON overall (matches the mobile app behavior more closely).
         message = json.dumps(payload, separators=(",", ":"))
-        encrypted = self._encrypt(message)
-
         topic = TOPIC_WRITE.format(sn=sn)
 
         try:
             if self.is_mqtt_connected():
-                # Some firmware revisions accept plaintext JSON on downChan;
-                # others use the XOR+base64 encoded form. To maximize compatibility
-                # we publish both.
-                published_plain = self._mqtt_client.publish(topic, message, 1)
-                published_encrypted = self._mqtt_client.publish(topic, encrypted, 1)
-                if not (published_plain or published_encrypted):
+                if not await self._mqtt_client.async_publish(topic, message, 1):
                     return False
                 _LOGGER.debug(
-                    "Sent command to %s: %s data=%s (plain+encrypted)",
+                    "Sent command to %s: %s data=%s",
                     sn,
                     cmd_type,
                     data_json,
@@ -1256,141 +1225,36 @@ class AiperApi:
             _LOGGER.error("Failed to send command: %s", err)
             return False
 
-    def start_cleaning(self, sn: str, mode: int = 1) -> bool:
-        """Start cleaning cycle."""
-        # Prefer direct downChan commands. Writing AWS IoT shadow desired-state can
-        # cause UI oscillation via /shadow/update/delta even when the device ignores it.
-        ok = self.send_command(sn, "Machine", {"status": 1, "mode": mode})
-        self.request_shadow(sn)
-        return ok
 
-    def stop_cleaning(self, sn: str) -> bool:
-        """Stop cleaning and return to dock."""
-        ok = self.send_command(sn, "Machine", {"status": 2})
-        self.request_shadow(sn)
-        return ok
 
-    def pause_cleaning(self, sn: str) -> bool:
-        """Pause cleaning."""
-        ok = self.send_command(sn, "Machine", {"status": 0})
-        self.request_shadow(sn)
-        return ok
 
-    def _try_rest_set_mode(self, sn: str, mode: int) -> bool:
-        """Best-effort REST fallback for setting cleaning mode."""
-        dev = self._devices.get(sn) or {}
-        equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id")
 
-        base_bodies: list[dict[str, Any]] = [
-            {"sn": sn, "mode": int(mode)},
-            {"sn": sn, "workMode": int(mode)},
-        ]
-        bodies: list[dict[str, Any]] = []
-        if equip_id is not None:
-            for body in base_bodies:
-                for id_key in ("id", "equipmentId", "deviceId"):
-                    candidate = dict(body)
-                    candidate[id_key] = equip_id
-                    bodies.append(candidate)
-        bodies.extend(base_bodies)
+    async def set_cleaning_mode(self, sn: str, mode: int) -> bool:
+        """Set a selectable cleaning mode."""
+        _LOGGER.info("Setting cleaning mode for %s: %s", sn, mode)
 
-        paths = (
-            "/equipment/updateWorkMode",
-            "/equipment/setWorkMode",
-            "/swimming/v2/updateWorkMode",
-            "/swimming/v2/setWorkMode",
-        )
+        cmd_result = await self.send_machine_at(sn, f"AT+MODE={mode}")
 
-        for path in paths:
-            for body in bodies:
-                try:
-                    payload = self._call_with_zoneid(sn, partial(self._call_encrypted, "POST", path, body))
-                    if payload and self._is_success(payload):
-                        return True
-                except Exception as err:
-                    _LOGGER.debug("REST mode update encrypted call failed (%s): %s", path, err)
-
-                try:
-                    payload = self._call_with_zoneid(sn, partial(self._call_plain, "POST", path, body))
-                    if payload and self._is_success(payload):
-                        return True
-                except Exception as err:
-                    _LOGGER.debug("REST mode update plain call failed (%s): %s", path, err)
-
-        return False
-
-    def set_mode(self, sn: str, mode: int) -> bool:
-        """Set the cleaning mode.
-
-        For Scuba X1, we treat all modes (including "Scheduled") as ``AT+MODE=<n>``.
-        Some firmwares expose ``AT+WORKMODE=<n>`` instead, so we try it as a fallback.
-
-        Note: Earlier experiments used ``AT+PLAN`` for "Scheduled", but the device
-        often responds ``+ERROR``. We therefore avoid ``AT+PLAN`` unless we have
-        hard evidence it is required.
-
-        The integration is intentionally optimistic: if the command is published but no ack
-        is received within the timeout, we still treat it as success to avoid the UI
-        snapping back while you validate device behavior.
-        """
-
-        _LOGGER.info("Setting mode for %s: %s", sn, mode)
-
-        # Some accounts/devices expose a REST setter. Keep it best-effort.
-        rest_ok = False
         try:
-            rest_ok = bool(self._try_rest_set_mode(sn, mode))
-        except Exception as err:  # pragma: no cover
-            _LOGGER.debug("REST set_mode failed for %s: %s", sn, err)
-
-        candidates = [
-            f"AT+MODE={mode}",
-            f"AT+WORKMODE={mode}",
-        ]
-
-        cmd_result: bool | None = False
-        for at_cmd in candidates:
-            cmd_result = self.send_machine_at(sn, at_cmd)
-            if cmd_result is True or cmd_result is None:
-                break
-
-        # Pull fresh shadow state (non-blocking).
-        try:
-            self.request_shadow(sn)
+            await self.request_shadow(sn)
         except Exception:
             pass
 
-        cmd_ok = cmd_result is True or cmd_result is None
-        return rest_ok or cmd_ok
+        return cmd_result is True
 
-    def _send_mode_commands(self, sn: str, mode: int) -> bool:
-        """Try different command formats for setting mode."""
-        results = []
-        
-        # Format 1: Standard Machine command (reported field)
-        r1 = self.send_command(sn, "Machine", {"mode": mode})
-        results.append(("Machine.mode", r1))
+    async def set_surfer_running(self, sn: str, running: bool) -> bool:
+        """Start or stop a Surfer-style surface skimmer."""
+        mode = SURFER_RUN_START_MODE if running else SURFER_RUN_STOP_MODE
+        _LOGGER.info("Setting Surfer run state for %s: %s", sn, running)
 
-        # Format 1b: AT-style commands (used heavily by the Android app)
-        # These are best-effort guesses; different firmware revisions use different names.
-        for at_name in ("WORKMODE", "MODE", "WMODE", "PLAN"):
-            r = self.send_command(sn, "Machine", {"cmd": f"AT+{at_name}={mode}"})
-            results.append((f"Machine.cmd AT+{at_name}=", r))
-        
-        # Format 2: SetMode command type (seen on some models)
-        r2 = self.send_command(sn, "SetMode", {"mode": mode})
-        results.append(("SetMode", r2))
-        
-        # Format 3: Control command type (seen on some models)
-        r3 = self.send_command(sn, "Control", {"cmd": "setMode", "mode": mode})
-        results.append(("Control", r3))
-        
-        # Format 4: GetWorkMode with mode (some devices use this to set)
-        r4 = self.send_command(sn, "GetWorkMode", {"mode": mode})
-        results.append(("GetWorkMode", r4))
-        
-        _LOGGER.info("Mode command results: %s", results)
-        return any(r for _, r in results)
+        cmd_result = await self.send_machine_at(sn, f"AT+MODE={mode}")
+
+        try:
+            await self.request_shadow(sn)
+        except Exception:
+            pass
+
+        return cmd_result is True
 
     def _crc16(self, data: str) -> int:
         """Calculate CRC16 checksum."""
@@ -1404,15 +1268,20 @@ class AiperApi:
                     crc >>= 1
         return crc
 
-    def disconnect(self) -> None:
+
+    async def disconnect(self) -> None:
         """Disconnect from MQTT and cleanup."""
         if self._mqtt_client:
             try:
-                self._mqtt_client.disconnect()
+                await self._mqtt_client.async_disconnect()
             except Exception:
                 pass
         self._mqtt_connected = False
         self._mqtt_client = None
-        
-        self._session.close()
+
+        if self._owns_async_session and self._async_session is not None:
+            await self._async_session.close()
+            self._async_session = None
+            self._owns_async_session = False
+
         _LOGGER.info("Disconnected from Aiper API")
