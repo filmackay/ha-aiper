@@ -120,6 +120,17 @@ def _is_wifi_connected(data: dict) -> bool | None:
     return sta in (1, 2, "1", "2")
 
 
+def _device_model(data: dict) -> str:
+    """Return the most specific model string available."""
+    return str(
+        data.get("model")
+        or data.get("deviceModel")
+        or data.get("modelName")
+        or data.get("productName")
+        or "Aiper Pool Cleaner"
+    )
+
+
 BINARY_SENSOR_DESCRIPTIONS: tuple[AiperBinarySensorEntityDescription, ...] = (
     AiperBinarySensorEntityDescription(
         key="online",
@@ -222,7 +233,7 @@ class AiperBinarySensor(CoordinatorEntity[AiperDataUpdateCoordinator], BinarySen
         self._attr_entity_registry_enabled_default = description.enabled_default
 
         # Device info
-        model = device_data.get("model", device_data.get("modelName", "Aiper Pool Cleaner"))
+        model = _device_model(device_data)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, sn)},
             name=device_data.get("name", f"Aiper {sn}"),

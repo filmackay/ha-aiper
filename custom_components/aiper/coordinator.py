@@ -646,8 +646,41 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             if start_dt is None and isinstance(start_val, (int, float)) and start_val > 10_000_000_000:
                 start_dt = datetime.fromtimestamp(float(start_val) / 1000.0, tz=timezone.utc)
 
-            dur_val = _deep_get(item, ("duration", "durationTime", "cleanTime", "cleaningTime", "runTime", "useTime", "lastTime", "timeUsed"))
-            dur_min = _minutes_from_value(dur_val)
+            duration_keys = (
+                "duration",
+                "durationTime",
+                "cleanTimeMin",
+                "cleanTimeMinute",
+                "cleaningTimeMin",
+                "cleanTime",
+                "cleaningTime",
+                "runTime",
+                "useTime",
+                "lastTime",
+                "timeUsed",
+            )
+            dur_val = None
+            dur_key = None
+            for duration_key in duration_keys:
+                if item.get(duration_key) is not None:
+                    dur_val = item.get(duration_key)
+                    dur_key = duration_key
+                    break
+            if dur_val is None:
+                dur_val = _deep_get(item, duration_keys)
+            dur_min = None
+            if dur_key:
+                norm_duration_key = _norm_key(dur_key)
+                n = _num(dur_val)
+                if n is not None:
+                    if "min" in norm_duration_key or "minute" in norm_duration_key:
+                        dur_min = n
+                    elif "sec" in norm_duration_key or "second" in norm_duration_key:
+                        dur_min = n / 60.0
+                    elif "hour" in norm_duration_key:
+                        dur_min = n * 60.0
+            if dur_min is None:
+                dur_min = _minutes_from_value(dur_val)
 
             records.append({
                 "mode_id": mid_int,
@@ -680,7 +713,10 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             return None
 
     if total_hours_from_records is not None:
-        # Determine if we likely have the full dataset
+        # Determine if we likely have the full dataset. When the backend gives
+        # us the complete record list, trust the record durations over loose
+        # total-like fields; Surfer S2 skimmer runs can be much longer than
+        # floor cleaner cycles and otherwise look "insane" to Scuba heuristics.
         likely_full = False
         if total_count is not None and isinstance(total_count, int) and total_count > 0:
             if records_len >= total_count:
@@ -689,25 +725,28 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             # no total count; assume list is authoritative
             likely_full = records_len >= 10
 
-        # Sanity check existing total_hours
-        avg_existing = _avg_min(total_hours, total_count) if (total_hours is not None and total_count) else None
-        avg_records = _avg_min(total_hours_from_records, (total_count or records_len))
-
-        existing_sane = (avg_existing is not None and 10.0 <= avg_existing <= 240.0)
-        records_sane = (avg_records is not None and 10.0 <= avg_records <= 240.0)
-
-        if total_hours is None and (likely_full or (total_count is None and records_len >= 10)):
+        if likely_full:
             total_hours = round(total_hours_from_records, 3)
-        elif likely_full and records_sane:
-            # Prefer record-derived when existing is missing/insane or far away
-            if (not existing_sane):
+        else:
+            # Sanity check existing total_hours
+            avg_existing = _avg_min(total_hours, total_count) if (total_hours is not None and total_count) else None
+            avg_records = _avg_min(total_hours_from_records, (total_count or records_len))
+
+            existing_sane = (avg_existing is not None and 10.0 <= avg_existing <= 240.0)
+            records_sane = (avg_records is not None and 10.0 <= avg_records <= 240.0)
+
+            if total_hours is None and total_count is None and records_len >= 10:
                 total_hours = round(total_hours_from_records, 3)
-            elif total_hours is not None:
-                try:
-                    if abs(float(total_hours) - float(total_hours_from_records)) / max(float(total_hours_from_records), 1.0) > 0.2:
-                        total_hours = round(total_hours_from_records, 3)
-                except Exception:
-                    pass
+            elif records_sane:
+                # Prefer record-derived when existing is missing/insane or far away.
+                if not existing_sane:
+                    total_hours = round(total_hours_from_records, 3)
+                elif total_hours is not None:
+                    try:
+                        if abs(float(total_hours) - float(total_hours_from_records)) / max(float(total_hours_from_records), 1.0) > 0.2:
+                            total_hours = round(total_hours_from_records, 3)
+                    except Exception:
+                        pass
 
     # If total_count is missing but we have records, populate it
     if total_count is None and records_len > 0:
@@ -1119,9 +1158,11 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     supported_ids = deduped_supported_ids
                 except Exception:
                     supported_ids = []
+                explicit_supported_modes = bool(supported_ids)
                 if not supported_ids:
                     supported_ids = list(MODE_MAP.keys())
                 self._devices[sn]["_ha_supported_mode_ids"] = supported_ids
+                self._devices[sn]["_ha_supported_modes_explicit"] = explicit_supported_modes
 
                 # Parse device info / firmware (diagnostic). Keys vary by region/firmware.
                 # We search across multiple blobs (device list, info, status, shadow) to

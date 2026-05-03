@@ -25,6 +25,8 @@ API_ENDPOINTS = {
     "us": "https://apiamerica.aiper.com",
     "eu": "https://apieurope.aiper.com",
     "asia": "https://apiasia.aiper.com",
+    # Australia accounts are served by the Asia/Pacific backend.
+    "au": "https://apiasia.aiper.com",
 }
 
 # AWS IoT Configuration
@@ -64,6 +66,8 @@ STATUS_MAP = {
     STATUS_ERROR: "Error",
     STATUS_SLEEPING: "Sleeping",
 }
+
+SCUBA_MODEL_MARKERS = ("scuba",)
 
 # Cleaning modes
 #

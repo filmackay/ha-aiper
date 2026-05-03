@@ -29,8 +29,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only in incomplete dev envs
     yaml = None
 
-from custom_components.aiper.api import AiperApi
-from custom_components.aiper.redaction import redact
+from custom_components.aiper.api import AiperApi  # noqa: E402
+from custom_components.aiper.redaction import redact  # noqa: E402
 
 
 DEFAULT_OUTPUT_DIR = Path("probe-output")
@@ -375,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--username", help="Aiper account username, or AIPER_USERNAME")
     common.add_argument("--password", help="Aiper account password, or AIPER_PASSWORD")
-    common.add_argument("--region", default="eu", choices=("eu", "us", "asia"), help="Aiper API region")
+    common.add_argument("--region", choices=("eu", "us", "asia", "au"), help="Aiper API region")
     common.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     common.add_argument("--mqtt-debug", action="store_true", help="Enable verbose MQTT logging in AiperApi")
 

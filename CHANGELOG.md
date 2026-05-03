@@ -11,6 +11,8 @@ This changelog tracks local modernization work intended for a future pull reques
 - Added local Home Assistant development runtime via `docker-compose.yml` and `ha-config/configuration.yaml`.
 - Added initial pytest suite covering config-flow validation helpers, diagnostics redaction, parser normalization, warning code handling, and consumable parsing.
 - Added service dispatch tests for the raw AT-command service across multiple loaded config entries.
+- Added Australia as a first-class region option backed by the Asia/Pacific Aiper API.
+- Added a Surfer S2 propeller maintenance timestamp sensor when the consumables endpoint reports propeller maintenance data.
 
 ### Changed
 
@@ -19,7 +21,10 @@ This changelog tracks local modernization work intended for a future pull reques
 - Normalized parsed Aiper datetime values to UTC-aware datetimes before exposing them to Home Assistant timestamp sensors.
 - Refactored `aiper.send_at_command` to register once at integration setup and dynamically dispatch to the config entry that owns the requested serial number.
 - Cleaned up lint issues surfaced by the new Ruff configuration.
+- Gated Scuba-only clean-path and fallback mode controls so Surfer S2 does not inherit unproven control entities.
 
 ### Fixed
 
 - Fixed config-flow test scaffolding so tests run through the `uv` managed Python environment.
+- Fixed Surfer S2 cleaning history parsing for long skimming runs that report explicit `cleanTimeMin` values.
+- Fixed `tools/aiper_probe.py` so `AIPER_REGION` is honored when `--region` is not provided.

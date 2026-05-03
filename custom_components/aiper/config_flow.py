@@ -34,6 +34,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
                 "us": "Americas",
                 "eu": "Europe",
                 "asia": "Asia/Pacific",
+                "au": "Australia",
             }
         ),
     }

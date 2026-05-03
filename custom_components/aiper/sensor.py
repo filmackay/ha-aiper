@@ -308,6 +308,17 @@ def _find_consumable(data: dict, *keywords: str) -> dict | None:
     return None
 
 
+def _device_model(data: dict) -> str:
+    """Return the most specific model string available."""
+    return str(
+        data.get("model")
+        or data.get("deviceModel")
+        or data.get("modelName")
+        or data.get("productName")
+        or "Aiper Pool Cleaner"
+    )
+
+
 def _get_ota_state(data: dict) -> str | None:
     shadow = data.get("shadow") or {}
     ota = shadow.get("otastatus") or {}
@@ -634,6 +645,15 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         available_fn=lambda data: (c := _find_consumable(data, "caterpillar")) is not None and c.get("last_replacement") is not None,
         enabled_default=False,
     ),
+    AiperSensorEntityDescription(
+        key="propeller_last_maintenance",
+        name="Propeller Last Maintenance",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: (c := _find_consumable(data, "propeller")) and c.get("last_replacement"),
+        available_fn=lambda data: (c := _find_consumable(data, "propeller")) is not None and c.get("last_replacement") is not None,
+        enabled_default=True,
+    ),
 )
 
 
@@ -684,7 +704,7 @@ class AiperSensor(CoordinatorEntity[AiperDataUpdateCoordinator], SensorEntity):
         self._attr_entity_registry_enabled_default = bool(description.enabled_default)
         
         # Device info
-        model = device_data.get("model", device_data.get("modelName", "Aiper Pool Cleaner"))
+        model = _device_model(device_data)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, sn)},
             name=device_data.get("name", f"Aiper {sn}"),

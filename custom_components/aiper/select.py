@@ -27,6 +27,7 @@ from .const import (
     CONF_QUEUE_OFFLINE_COMMANDS,
     MODE_MAP,
     CLEAN_PATH_MAP,
+    SCUBA_MODEL_MARKERS,
 )
 from .coordinator import AiperDataUpdateCoordinator
 
@@ -72,6 +73,28 @@ def _device_online(coordinator: AiperDataUpdateCoordinator, sn: str) -> bool | N
         return None
 
 
+def _device_model(dev: dict[str, Any]) -> str:
+    """Return the most specific model string available."""
+    return str(
+        dev.get("model")
+        or dev.get("deviceModel")
+        or dev.get("modelName")
+        or dev.get("productName")
+        or "Aiper Pool Cleaner"
+    )
+
+
+def _supports_clean_path(dev: dict[str, Any]) -> bool:
+    """Return whether the Scuba clean-path control should be exposed."""
+    model = _device_model(dev).lower()
+    return any(marker in model for marker in SCUBA_MODEL_MARKERS)
+
+
+def _supports_mode_control(dev: dict[str, Any]) -> bool:
+    """Return whether mode control has enough evidence to be exposed."""
+    return _supports_clean_path(dev) or bool(dev.get("_ha_supported_modes_explicit"))
+
+
 class AiperSelectBase(CoordinatorEntity[AiperDataUpdateCoordinator], SelectEntity):
     """Base class for Aiper select entities."""
 
@@ -103,7 +126,7 @@ class AiperSelectBase(CoordinatorEntity[AiperDataUpdateCoordinator], SelectEntit
     @property
     def device_info(self) -> DeviceInfo:
         dev = (self.coordinator.data or {}).get(self._sn) or {}
-        model = dev.get("model") or dev.get("productName") or "Aiper Pool Cleaner"
+        model = _device_model(dev)
         sw = dev.get("_ha_fw_main") or dev.get("firmwareVersion")
         return {
             "identifiers": {(DOMAIN, self._sn)},
@@ -415,7 +438,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 # fallback to known modes
                 supported = sorted(MODE_MAP.keys())
 
-            entities.append(AiperCleanPathSelect(coordinator, entry, sn, name))
-            entities.append(AiperCleaningModeSelect(coordinator, entry, sn, name, supported, mqtt_enabled))
+            if _supports_clean_path(dev):
+                entities.append(AiperCleanPathSelect(coordinator, entry, sn, name))
+            if _supports_mode_control(dev):
+                entities.append(AiperCleaningModeSelect(coordinator, entry, sn, name, supported, mqtt_enabled))
 
     async_add_entities(entities)

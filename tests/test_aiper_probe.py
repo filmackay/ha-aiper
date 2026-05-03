@@ -29,3 +29,16 @@ def test_at_command_requires_explicit_control_permission() -> None:
 def test_device_sn_preserves_serial_value() -> None:
     """The probe should use real serial numbers for correlation."""
     assert aiper_probe._device_sn({"serialNumber": "S2SERIAL123"}) == "S2SERIAL123"
+
+
+def test_credentials_use_region_environment_when_cli_region_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The parser default should not mask AIPER_REGION."""
+    monkeypatch.setenv("AIPER_USERNAME", "user@example.com")
+    monkeypatch.setenv("AIPER_PASSWORD", "secret")
+    monkeypatch.setenv("AIPER_REGION", "asia")
+
+    username, password, region = aiper_probe._credentials(Namespace(username=None, password=None, region=None))
+
+    assert username == "user@example.com"
+    assert password == "secret"
+    assert region == "asia"

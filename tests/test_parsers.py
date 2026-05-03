@@ -60,6 +60,38 @@ def test_parse_cleaning_history_extracts_totals_and_records() -> None:
     assert records[0]["start"].tzinfo == timezone.utc
 
 
+def test_parse_cleaning_history_handles_surfer_s2_long_runs() -> None:
+    """Surfer S2 history can contain multi-hour skimming sessions."""
+    total_count, total_hours, records = _parse_cleaning_history(
+        {
+            "code": "200",
+            "data": {
+                "list": [
+                    {
+                        "cleanMode": "5",
+                        "cleanTime": 14401,
+                        "cleanTimeMin": 240,
+                        "utcStartTimeStamp": 1777741200000,
+                    },
+                    {
+                        "cleanMode": "1",
+                        "cleanTime": 49713,
+                        "cleanTimeMin": 828,
+                        "utcStartTimeStamp": 1777691487000,
+                    },
+                ],
+                "pageNum": 1,
+                "pageSize": 20,
+                "total": 2,
+            },
+        }
+    )
+
+    assert total_count == 2
+    assert total_hours == 17.8
+    assert [record["duration_min"] for record in records] == [240.0, 828.0]
+
+
 def test_parse_consumables_normalizes_remaining_percent_and_timestamp() -> None:
     """Consumables should expose stable names and derived percent-left values."""
     consumables = _parse_consumables(

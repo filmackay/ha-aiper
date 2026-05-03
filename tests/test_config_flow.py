@@ -70,6 +70,20 @@ async def test_validate_input_returns_title_and_device_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_validate_input_accepts_australia_region_alias() -> None:
+    """Australia is a first-class region option backed by Asia/Pacific."""
+    data = {
+        CONF_USERNAME: "user@example.com",
+        CONF_PASSWORD: "secret",
+        CONF_REGION: "au",
+    }
+
+    await validate_input(FakeHass(), data)
+
+    assert FakeAiperApi.instances[0].region == "au"
+
+
+@pytest.mark.asyncio
 async def test_validate_input_raises_invalid_auth_when_login_fails(
     fake_api: type[FakeAiperApi],
 ) -> None:
