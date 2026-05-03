@@ -35,17 +35,12 @@ jobs:
           ignore: brands
         continue-on-error: true
 
-      - name: Set up Python
-        id: setup-python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-
       - name: Install uv
         id: setup-uv
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.14"
 
       - name: Install dependencies
         id: sync
@@ -70,11 +65,25 @@ jobs:
       - name: Check validation outcomes
         if: ${{ always() }}
         run: |
-          test "${{ steps.hassfest.outcome }}" = "success"
-          test "${{ steps.hacs.outcome }}" = "success"
-          test "${{ steps.setup-python.outcome }}" = "success"
-          test "${{ steps.setup-uv.outcome }}" = "success"
-          test "${{ steps.sync.outcome }}" = "success"
-          test "${{ steps.ruff.outcome }}" = "success"
-          test "${{ steps.mypy.outcome }}" = "success"
-          test "${{ steps.pytest.outcome }}" = "success"
+          failed=0
+
+          check_step() {
+            name="$1"
+            outcome="$2"
+            if [ "$outcome" = "success" ]; then
+              echo "::notice title=${name}::passed"
+            else
+              echo "::error title=${name} failed::outcome=${outcome}"
+              failed=1
+            fi
+          }
+
+          check_step "hassfest" "${{ steps.hassfest.outcome }}"
+          check_step "HACS validation" "${{ steps.hacs.outcome }}"
+          check_step "uv setup" "${{ steps.setup-uv.outcome }}"
+          check_step "dependency sync" "${{ steps.sync.outcome }}"
+          check_step "Ruff" "${{ steps.ruff.outcome }}"
+          check_step "mypy" "${{ steps.mypy.outcome }}"
+          check_step "pytest" "${{ steps.pytest.outcome }}"
+
+          exit "$failed"
