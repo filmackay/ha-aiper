@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import AiperApi
+from .api import AiperApi, AiperSessionConflict
 from .const import (
     CONF_ENABLE_MQTT,
     CONF_MQTT_DEBUG,
@@ -59,6 +59,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         # Get devices to show count
         devices = await api.get_devices()
 
+    except AiperSessionConflict as err:
+        _LOGGER.error("Aiper account session conflict during validation: %s", err)
+        raise CannotConnect from err
     except Exception as err:
         _LOGGER.error("Login validation failed: %s", err)
         raise InvalidAuth from err

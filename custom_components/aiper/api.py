@@ -46,6 +46,17 @@ from .profiles import DeviceFamily, device_family
 
 _LOGGER = logging.getLogger(__name__)
 
+SESSION_CONFLICT_CODE = "402"
+SESSION_CONFLICT_COOLDOWN_SECONDS = 180
+
+
+class AiperApiError(Exception):
+    """Base exception for Aiper API failures."""
+
+
+class AiperSessionConflict(AiperApiError):
+    """Raised when Aiper rejects a request because another session is active."""
+
 
 class AiperApi:
     """Client for Aiper cloud API and MQTT."""
@@ -64,6 +75,7 @@ class AiperApi:
         self.base_url = API_ENDPOINTS.get(region, API_ENDPOINTS["eu"])
         self._async_session = async_session
         self._owns_async_session = False
+        self._session_conflict_until = 0.0
         
         self._token: str | None = None
         self._user_id: str | None = None
@@ -116,6 +128,30 @@ class AiperApi:
         code = payload.get("code")
         successful = payload.get("successful")
         return str(code) in ("0", "200") or successful is True
+
+    @staticmethod
+    def _is_session_conflict(payload: dict[str, Any]) -> bool:
+        """Return whether Aiper says this account is active in another session."""
+        return str(payload.get("code")) == SESSION_CONFLICT_CODE
+
+    @staticmethod
+    def _payload_message(payload: dict[str, Any]) -> str:
+        """Return the best available human-readable API error message."""
+        return str(payload.get("msg") or payload.get("message") or payload.get("mess") or "Unknown error")
+
+    def _raise_if_session_conflict_active(self, path: str) -> None:
+        """Avoid repeatedly fighting the mobile app after a confirmed conflict."""
+        if path == "/login":
+            return
+        remaining = self._session_conflict_until - time.time()
+        if remaining > 0:
+            raise AiperSessionConflict(
+                f"Aiper account is active in another session; retrying after {int(remaining)} seconds"
+            )
+
+    def _mark_session_conflict(self, payload: dict[str, Any]) -> None:
+        self._session_conflict_until = time.time() + SESSION_CONFLICT_COOLDOWN_SECONDS
+        raise AiperSessionConflict(self._payload_message(payload))
 
     def _device_family_for_sn(self, sn: str) -> DeviceFamily:
         """Return the discovered family for a device serial number."""
@@ -172,6 +208,7 @@ class AiperApi:
         retry_login: bool = True,
     ) -> dict[str, Any]:
         """Call an Aiper REST endpoint using the AES/RSA envelope."""
+        self._raise_if_session_conflict_active(path)
         enc = AiperEncryption()
 
         headers = dict(self._headers)
@@ -189,6 +226,29 @@ class AiperApi:
             payload = json.loads(decrypted)
         except Exception as err:
             raise Exception(f"Failed to parse decrypted response from {path}: {decrypted[:200]}") from err
+
+        if retry_login and path != "/login" and self._is_session_conflict(payload):
+            _LOGGER.info("Aiper account session conflict; re-authenticating once before backing off")
+            try:
+                if await self.login():
+                    retry_payload = await self._call_encrypted(
+                        method,
+                        path,
+                        body,
+                        base_url=base_url,
+                        token=self._token,
+                        timeout=timeout,
+                        retry_login=False,
+                    )
+                    if not self._is_session_conflict(retry_payload):
+                        self._session_conflict_until = 0.0
+                        return retry_payload
+                    payload = retry_payload
+            except AiperSessionConflict:
+                raise
+            except Exception as err:
+                _LOGGER.debug("Session-conflict re-authentication failed: %s", err)
+            self._mark_session_conflict(payload)
 
         if retry_login and str(payload.get("code")) in ("401", "403"):
             _LOGGER.info("Token appears expired; attempting refresh")
