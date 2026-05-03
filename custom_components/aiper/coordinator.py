@@ -166,7 +166,7 @@ def _parse_dt(value: Any) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value
+        return _ensure_utc_aware(value)
     # Epoch seconds or milliseconds
     if isinstance(value, (int, float)):
         try:
@@ -184,7 +184,7 @@ def _parse_dt(value: Any) -> datetime | None:
         try:
             dt = dt_util.parse_datetime(s)
             if dt:
-                return dt
+                return _ensure_utc_aware(dt)
         except Exception:
             dt = None
         # Common app formats
@@ -501,7 +501,8 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
 
     # de-dup
     def _dedup(pairs):
-        seen=set(); out=[]
+        seen = set()
+        out = []
         for k,v in pairs:
             kk=_norm_key(k)
             if (kk,v) in seen:
@@ -512,11 +513,11 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
     count_cands=_dedup(count_cands)
     time_cands=_dedup(time_cands)
 
-    total_count = None
-    total_hours = None
+    total_count: int | None = None
+    total_hours: float | None = None
 
     best_score = -1e18
-    best_pair = (None, None)
+    best_pair: tuple[tuple[Any, int] | None, tuple[Any, float] | None] = (None, None)
 
     def score_pair(ck, c, tk, h):
         if c <= 0 or h <= 0:
@@ -579,7 +580,7 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             return None
         as_sec = n / 60.0
         as_min = n
-        cand=[]
+        cand: list[tuple[int, float]] = []
         if 0.5 <= as_sec <= 300:
             cand.append((0, as_sec))
         if 0.5 <= as_min <= 300:
@@ -603,7 +604,7 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             if v is not None:
                 return v
         # deep scan for datetime-like strings
-        stack=[item]
+        stack: list[Any] = [item]
         while stack:
             obj=stack.pop()
             if isinstance(obj, dict):
@@ -663,12 +664,16 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
     # compute total hours from the sum of record durations. This avoids unit/field drift
     # across regional API variants and prevents obviously incorrect totals.
     try:
-        dur_sum_min = sum(float(r.get('duration_min')) for r in records if r.get('duration_min') is not None)
+        dur_sum_min = 0.0
+        for record in records:
+            duration_min = record.get("duration_min")
+            if duration_min is not None:
+                dur_sum_min += float(duration_min)
     except Exception:
         dur_sum_min = 0.0
     total_hours_from_records = (dur_sum_min / 60.0) if dur_sum_min > 0 else None
 
-    def _avg_min(h, c):
+    def _avg_min(h: Any, c: Any) -> float | None:
         try:
             return (float(h) * 60.0) / float(c)
         except Exception:
@@ -697,7 +702,7 @@ def _parse_cleaning_history(raw: Any) -> tuple[int | None, float | None, list[di
             # Prefer record-derived when existing is missing/insane or far away
             if (not existing_sane):
                 total_hours = round(total_hours_from_records, 3)
-            else:
+            elif total_hours is not None:
                 try:
                     if abs(float(total_hours) - float(total_hours_from_records)) / max(float(total_hours_from_records), 1.0) > 0.2:
                         total_hours = round(total_hours_from_records, 3)
@@ -911,9 +916,9 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Initialize the coordinator."""
         self._normal_interval = timedelta(seconds=max(5, int(scan_interval)))
         self._fast_interval = timedelta(seconds=FAST_SCAN_INTERVAL_SECONDS)
-        self._fast_poll_until = None  # type: ignore[assignment]
+        self._fast_poll_until: datetime | None = None
         self._last_online: dict[str, bool | None] = {}
-        self._last_fast_trigger = None  # type: ignore[assignment]
+        self._last_fast_trigger: datetime | None = None
 
         super().__init__(
             hass,
@@ -1093,9 +1098,10 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                     supported_ids.append(int(v))
                                 elif isinstance(v, dict):
                                     for kk in ("mode", "id", "value"):
-                                        if kk in v and v.get(kk) is not None:
+                                        mode_value = v.get(kk)
+                                        if mode_value is not None:
                                             try:
-                                                supported_ids.append(int(v.get(kk)))
+                                                supported_ids.append(int(mode_value))
                                             except Exception:
                                                 pass
                                 elif isinstance(v, str) and v.strip().isdigit():
@@ -1103,8 +1109,14 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         elif isinstance(cand, (int, float)):
                             supported_ids.append(int(cand))
                     # De-dup and preserve ordering
-                    seen = set()
-                    supported_ids = [x for x in supported_ids if not (x in seen or seen.add(x))]
+                    seen: set[int] = set()
+                    deduped_supported_ids: list[int] = []
+                    for supported_id in supported_ids:
+                        if supported_id in seen:
+                            continue
+                        seen.add(supported_id)
+                        deduped_supported_ids.append(supported_id)
+                    supported_ids = deduped_supported_ids
                 except Exception:
                     supported_ids = []
                 if not supported_ids:
@@ -1260,7 +1272,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.update_interval = self._normal_interval
 
             # Merge device data with shadow data
-            result = {}
+            result: dict[str, Any] = {}
             for sn, device in self._devices.items():
                 result[sn] = {
                     **device,
@@ -1290,14 +1302,16 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if data is None and isinstance(sn, dict):
             payload = sn
             data = payload
-            sn = (
+            payload_data = payload.get("data")
+            serial = (
                 payload.get("_sn")
                 or payload.get("sn")
-                or (payload.get("data") or {}).get("sn")
+                or (payload_data.get("sn") if isinstance(payload_data, dict) else None)
             )
-            if not sn:
+            if not serial:
                 _LOGGER.debug("Ignoring MQTT update with no serial number: %s", payload)
                 return
+            sn = str(serial)
 
         if data is None:
             return
@@ -1707,8 +1721,9 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for kind, info in pend.items():
             if not isinstance(info, dict):
                 continue
+            since_raw = info.get("since")
             try:
-                since = dt_util.parse_datetime(info.get("since")) if info.get("since") else None
+                since = dt_util.parse_datetime(since_raw) if isinstance(since_raw, str) else None
             except Exception:
                 since = None
             if since is None:

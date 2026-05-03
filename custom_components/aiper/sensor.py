@@ -62,6 +62,19 @@ def _coerce_bool(val: Any) -> bool | None:
     return bool(val)
 
 
+def _coerce_int(val: Any) -> int | None:
+    """Coerce common numeric payload values into an int."""
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str) and val.strip().lstrip("-").isdigit():
+        return int(val.strip())
+    return None
+
+
 def _is_online(data: dict) -> bool | None:
     """Best-effort online evaluation."""
     status_data = data.get("status_data") or {}
@@ -114,12 +127,14 @@ def _get_status(data: dict) -> str:
     # REST API uses 'machineStatus' directly on device
     if "machineStatus" in data and data.get("machineStatus") is not None:
         status = data.get("machineStatus")
-        return STATUS_MAP.get(status, f"Status {status}")
+        status_id = _coerce_int(status)
+        return STATUS_MAP.get(status_id, f"Status {status}") if status_id is not None else f"Status {status}"
 
     # Fallback to shadow data (from MQTT)
     shadow_status = (data.get("shadow") or {}).get("machine", {}).get("status")
     if shadow_status is not None:
-        return STATUS_MAP.get(shadow_status, f"Status {shadow_status}")
+        status_id = _coerce_int(shadow_status)
+        return STATUS_MAP.get(status_id, f"Status {shadow_status}") if status_id is not None else f"Status {shadow_status}"
 
     # If we are online but have no status code, present as Idle (per UX requirement)
     return "Idle"
@@ -129,13 +144,18 @@ def _get_mode(data: dict) -> str:
     """Get cleaning mode from device data."""
     # Check for mode in device data
     if "cleanMode" in data:
-        return MODE_MAP.get(data.get("cleanMode"), f"Mode {data.get('cleanMode')}")
+        mode = data.get("cleanMode")
+        mode_id = _coerce_int(mode)
+        return MODE_MAP.get(mode_id, f"Mode {mode}") if mode_id is not None else f"Mode {mode}"
     if "mode" in data:
-        return MODE_MAP.get(data.get("mode"), f"Mode {data.get('mode')}")
+        mode = data.get("mode")
+        mode_id = _coerce_int(mode)
+        return MODE_MAP.get(mode_id, f"Mode {mode}") if mode_id is not None else f"Mode {mode}"
     # Fallback to shadow data (from MQTT)
     shadow_mode = data.get("shadow", {}).get("machine", {}).get("mode")
     if shadow_mode is not None:
-        return MODE_MAP.get(shadow_mode, f"Mode {shadow_mode}")
+        mode_id = _coerce_int(shadow_mode)
+        return MODE_MAP.get(mode_id, f"Mode {shadow_mode}") if mode_id is not None else f"Mode {shadow_mode}"
     return "Unknown"
 
 
@@ -298,8 +318,8 @@ def _get_ota_state(data: dict) -> str | None:
         if k in ota and ota.get(k) is not None:
             v = ota.get(k)
             # Normalize common numeric states.
-            try:
-                iv = int(v)
+            iv = _coerce_int(v)
+            if iv is not None:
                 if iv == 0:
                     return "Idle"
                 if iv == 1:
@@ -308,8 +328,6 @@ def _get_ota_state(data: dict) -> str | None:
                     return "Installing"
                 if iv == 3:
                     return "Rebooting"
-            except Exception:
-                pass
             return str(v)
     return None
 

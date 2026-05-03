@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from functools import partial
 import json
 import logging
 import threading
@@ -113,13 +114,13 @@ class AiperApi:
         self,
         method: str,
         path: str,
-        body: dict | None = None,
+        body: dict[str, Any] | None = None,
         *,
         base_url: str | None = None,
         token: str | None = None,
         timeout: int = 30,
         retry_login: bool = True,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Call an Aiper REST endpoint using the AES/RSA envelope.
 
         Most endpoints expect:
@@ -228,12 +229,12 @@ class AiperApi:
         self,
         method: str,
         path: str,
-        body: dict | None = None,
+        body: dict[str, Any] | None = None,
         *,
         base_url: str | None = None,
         token: str | None = None,
         timeout: int = 30,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Call an Aiper REST endpoint without the AES/RSA envelope.
 
         Some endpoints in the Aiper app ecosystem appear to accept (or require)
@@ -331,13 +332,14 @@ class AiperApi:
         if isinstance(zid, str) and zid:
             return zid
         # Fall back to whatever is already configured on the session.
-        zid = self._session.headers.get("zoneId")
-        return str(zid) if isinstance(zid, str) and zid else None
+        header_zid = self._session.headers.get("zoneId")
+        return header_zid if isinstance(header_zid, str) and header_zid else None
 
     def _call_with_zoneid(self, sn: str, fn: Callable[[], Any]) -> Any:
         """Invoke `fn` while temporarily setting the zoneId header for `sn`."""
         zid = self._zone_id_for_sn(sn)
-        prev = self._session.headers.get("zoneId")
+        prev_value = self._session.headers.get("zoneId")
+        prev = prev_value if isinstance(prev_value, str) else None
         if zid:
             self._session.headers["zoneId"] = zid
         try:
@@ -556,7 +558,7 @@ class AiperApi:
         place totals (counts/time) at the root level instead of under `data`.
         """
 
-        def _do(body: dict) -> Any:
+        def _do(body: dict[str, Any]) -> Any:
             payload = self._call_encrypted("POST", "/swimming/v2/getCleanTimeBySn", body)
             if self._is_success(payload):
                 return payload
@@ -594,7 +596,7 @@ class AiperApi:
             dev = self._devices.get(sn) or {}
             equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id") or dev.get("eid")
 
-            bodies: list[dict] = []
+            bodies: list[dict[str, Any]] = []
             # Common shapes
             bodies.extend([
                 {"sn": sn},
@@ -617,7 +619,7 @@ class AiperApi:
 
             # Try each body until we get a non-empty payload
             for body in bodies:
-                data = self._call_with_zoneid(sn, lambda b=body: _do(b))
+                data = self._call_with_zoneid(sn, partial(_do, body))
                 if data:
                     return data
 
@@ -675,7 +677,7 @@ class AiperApi:
                 candidate_paths.append(sp)
 
         # Try a few common payload shapes.
-        bodies: list[dict] = [{"sn": sn}]
+        bodies: list[dict[str, Any]] = [{"sn": sn}]
         if equip_id is not None:
             bodies.insert(0, {"sn": sn, "id": equip_id})
             bodies.insert(1, {"sn": sn, "equipmentId": equip_id})
@@ -685,13 +687,13 @@ class AiperApi:
             for body in bodies:
                 payload = None
                 try:
-                    payload = self._call_with_zoneid(sn, lambda p=path, b=body: self._call_encrypted("POST", p, b))
+                    payload = self._call_with_zoneid(sn, partial(self._call_encrypted, "POST", path, body))
                 except Exception as err:
                     _LOGGER.debug("Clean path query encrypted call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     try:
-                        payload = self._call_with_zoneid(sn, lambda p=path, b=body: self._call_plain("POST", p, b))
+                        payload = self._call_with_zoneid(sn, partial(self._call_plain, "POST", path, body))
                     except Exception as err:
                         _LOGGER.debug("Clean path query plain call failed (%s): %s", path, err)
 
@@ -781,11 +783,11 @@ class AiperApi:
 
         # Try multiple key variants; some backends expect cleanPathSetting.
         key_variants = ("cleanPath", "cleanPathSetting", "clean_path_setting")
-        base_bodies: list[dict] = []
+        base_bodies: list[dict[str, Any]] = []
         for k in key_variants:
             base_bodies.append({"sn": sn, k: int(value)})
 
-        bodies: list[dict] = []
+        bodies: list[dict[str, Any]] = []
         if equip_id is not None:
             for bb in base_bodies:
                 for idk in ("id", "equipmentId", "deviceId"):
@@ -799,13 +801,13 @@ class AiperApi:
             for body in bodies:
                 payload = None
                 try:
-                    payload = self._call_with_zoneid(sn, lambda p=path, b=body: self._call_encrypted("POST", p, b))
+                    payload = self._call_with_zoneid(sn, partial(self._call_encrypted, "POST", path, body))
                 except Exception as err:
                     _LOGGER.debug("Clean path update encrypted call failed (%s): %s", path, err)
 
                 if not payload or not self._is_success(payload):
                     try:
-                        payload = self._call_with_zoneid(sn, lambda p=path, b=body: self._call_plain("POST", p, b))
+                        payload = self._call_with_zoneid(sn, partial(self._call_plain, "POST", path, body))
                     except Exception as err:
                         _LOGGER.debug("Clean path update plain call failed (%s): %s", path, err)
 
@@ -1281,6 +1283,49 @@ class AiperApi:
         ok = self.send_command(sn, "Machine", {"status": 0})
         self.request_shadow(sn)
         return ok
+
+    def _try_rest_set_mode(self, sn: str, mode: int) -> bool:
+        """Best-effort REST fallback for setting cleaning mode."""
+        dev = self._devices.get(sn) or {}
+        equip_id = dev.get("equipmentId") or dev.get("deviceId") or dev.get("id")
+
+        base_bodies: list[dict[str, Any]] = [
+            {"sn": sn, "mode": int(mode)},
+            {"sn": sn, "workMode": int(mode)},
+        ]
+        bodies: list[dict[str, Any]] = []
+        if equip_id is not None:
+            for body in base_bodies:
+                for id_key in ("id", "equipmentId", "deviceId"):
+                    candidate = dict(body)
+                    candidate[id_key] = equip_id
+                    bodies.append(candidate)
+        bodies.extend(base_bodies)
+
+        paths = (
+            "/equipment/updateWorkMode",
+            "/equipment/setWorkMode",
+            "/swimming/v2/updateWorkMode",
+            "/swimming/v2/setWorkMode",
+        )
+
+        for path in paths:
+            for body in bodies:
+                try:
+                    payload = self._call_with_zoneid(sn, partial(self._call_encrypted, "POST", path, body))
+                    if payload and self._is_success(payload):
+                        return True
+                except Exception as err:
+                    _LOGGER.debug("REST mode update encrypted call failed (%s): %s", path, err)
+
+                try:
+                    payload = self._call_with_zoneid(sn, partial(self._call_plain, "POST", path, body))
+                    if payload and self._is_success(payload):
+                        return True
+                except Exception as err:
+                    _LOGGER.debug("REST mode update plain call failed (%s): %s", path, err)
+
+        return False
 
     def set_mode(self, sn: str, mode: int) -> bool:
         """Set the cleaning mode.

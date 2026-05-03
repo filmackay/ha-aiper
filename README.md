@@ -15,6 +15,24 @@ Copy `custom_components/aiper` into your Home Assistant `config/custom_component
 ## Configuration
 Add the integration via **Settings → Devices & Services → Add Integration → Aiper Pool Cleaner**.
 
+## Development
+
+This repository uses `uv` for local development tooling.
+
+```bash
+uv sync
+uv run ruff check .
+uv run python -m compileall custom_components
+```
+
+Run a local Home Assistant container with the integration bind-mounted:
+
+```bash
+docker compose up
+```
+
+Then open Home Assistant at <http://localhost:8123>.
+
 ## Notes
 - This integration uses Aiper's cloud + AWS IoT (MQTT) control plane.
 - Set device “Clean Path” is applied via downChan to ensure it takes effect on supported models/regions.

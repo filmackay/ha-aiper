@@ -18,6 +18,7 @@ from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
@@ -100,7 +101,7 @@ class AiperSelectBase(CoordinatorEntity[AiperDataUpdateCoordinator], SelectEntit
         self._requires_mqtt = mqtt_required
 
     @property
-    def device_info(self) -> dict[str, Any]:
+    def device_info(self) -> DeviceInfo:
         dev = (self.coordinator.data or {}).get(self._sn) or {}
         model = dev.get("model") or dev.get("productName") or "Aiper Pool Cleaner"
         sw = dev.get("_ha_fw_main") or dev.get("firmwareVersion")
@@ -223,9 +224,10 @@ class AiperCleaningModeSelect(AiperSelectBase):
         info = dev.get("info") or {}
         if isinstance(info, dict):
             for k in ("mode", "workMode"):
-                if k in info and info.get(k) is not None:
+                mode_value = info.get(k)
+                if mode_value is not None:
                     try:
-                        return int(info.get(k))
+                        return int(mode_value)
                     except Exception:
                         continue
         return None

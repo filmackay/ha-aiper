@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_registry import RegistryEntryDisabler
@@ -24,6 +25,70 @@ PLATFORMS: list[Platform] = [
 
 SERVICE_SEND_AT = "send_at_command"
 
+
+def _async_find_service_target(
+    hass: HomeAssistant,
+    sn: str | None,
+) -> tuple[AiperApi, AiperDataUpdateCoordinator, str] | None:
+    """Find the API/coordinator/device serial number for a service call."""
+    entries: dict[str, dict[str, Any]] = hass.data.get(DOMAIN, {})
+
+    if sn:
+        for data in entries.values():
+            coordinator: AiperDataUpdateCoordinator | None = data.get("coordinator")
+            if coordinator and coordinator.data and sn in coordinator.data:
+                return data["api"], coordinator, sn
+        return None
+
+    for data in entries.values():
+        coordinator = data.get("coordinator")
+        if coordinator and coordinator.data:
+            first_sn = next(iter(coordinator.data.keys()), None)
+            if first_sn:
+                return data["api"], coordinator, first_sn
+
+    return None
+
+
+async def _async_send_at_command_service(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Send a raw AT command to a discovered Aiper device."""
+    sn = call.data.get("sn")
+    sn = str(sn).strip() if sn else None
+
+    target = _async_find_service_target(hass, sn)
+    if target is None:
+        if sn:
+            _LOGGER.warning("send_at_command called for unknown Aiper device SN: %s", sn)
+        else:
+            _LOGGER.warning("send_at_command called but no Aiper device SN is available")
+        return
+
+    api, _coordinator, resolved_sn = target
+
+    cmd = str(call.data.get("command", "")).strip()
+    if not cmd:
+        _LOGGER.warning("send_at_command called with empty command")
+        return
+
+    if not cmd.upper().startswith("AT+"):
+        cmd = "AT+" + cmd
+
+    await hass.async_add_executor_job(api.send_machine_at, resolved_sn, cmd)
+    await hass.async_add_executor_job(api.request_shadow, resolved_sn)
+
+
+async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+    """Set up the Aiper integration."""
+    hass.data.setdefault(DOMAIN, {})
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SEND_AT):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SEND_AT,
+            lambda call: _async_send_at_command_service(hass, call),
+        )
+
+    return True
 
 
 def _mqtt_enabled(entry: ConfigEntry) -> bool:
@@ -407,40 +472,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info("Aiper integration setup complete")
 
-    # Debug/engineering service: send a raw AT command over MQTT.
-    async def _svc_send_at(call):
-        api: AiperApi = hass.data[DOMAIN][entry.entry_id]["api"]
-        coordinator: AiperDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-
-        sn = call.data.get("sn")
-        if not sn and coordinator.data:
-            sn = next(iter(coordinator.data.keys()))
-        if not sn:
-            _LOGGER.warning("send_at_command called but no device SN is available")
-            return
-
-        cmd = str(call.data.get("command", "")).strip()
-        if not cmd:
-            _LOGGER.warning("send_at_command called with empty command")
-            return
-
-        if not cmd.upper().startswith("AT+"):
-            cmd = "AT+" + cmd
-
-        await hass.async_add_executor_job(api.send_machine_at, sn, cmd)
-        await hass.async_add_executor_job(api.request_shadow, sn)
-
-    # Register once per config entry.
-    hass.services.async_register(DOMAIN, SERVICE_SEND_AT, _svc_send_at)
-
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        if hass.services.has_service(DOMAIN, SERVICE_SEND_AT):
-            hass.services.async_remove(DOMAIN, SERVICE_SEND_AT)
         data = hass.data[DOMAIN].pop(entry.entry_id)
         unsub = data.get("_unsub_keepalive")
         if callable(unsub):
