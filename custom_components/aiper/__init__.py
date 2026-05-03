@@ -400,6 +400,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("Failed to login to Aiper: %s", err)
         raise ConfigEntryNotReady from err
 
+    enable_mqtt = _mqtt_enabled(entry)
     scan_interval = int(entry.options.get(CONF_POLL_INTERVAL, DEFAULT_SCAN_INTERVAL))
     coordinator = AiperDataUpdateCoordinator(
         hass,
@@ -408,14 +409,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         history_refresh_hours=entry.options.get(CONF_HISTORY_REFRESH_HOURS, DEFAULT_HISTORY_REFRESH_HOURS),
         consumables_refresh_hours=entry.options.get(CONF_CONSUMABLES_REFRESH_HOURS, DEFAULT_CONSUMABLES_REFRESH_HOURS),
         clean_path_refresh_hours=entry.options.get(CONF_CLEAN_PATH_REFRESH_HOURS, DEFAULT_CLEAN_PATH_REFRESH_HOURS),
+        push_primary=enable_mqtt,
     )
     
     _LOGGER.debug("Performing first data refresh...")
     await coordinator.async_config_entry_first_refresh()
     _LOGGER.info("First refresh complete, data: %s", list(coordinator.data.keys()) if coordinator.data else "None")
 
-    # Ensure periodic polling continues even if no entities are currently
-    # attached as listeners (or if HA delays entity listener registration).
+    # Ensure scheduled REST fallback or slow reconciliation continues even if no
+    # entities are currently attached as listeners (or if HA delays entity
+    # listener registration).
     # Without at least one listener, DataUpdateCoordinator will not schedule
     # timed refreshes.
     def _keepalive_listener() -> None:
@@ -443,8 +446,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await _disable_mqtt_only_entities(hass, entry)
 
-    # Optional: enable AWS IoT MQTT for near real-time updates.
-    enable_mqtt = _mqtt_enabled(entry)
+    # Optional: enable AWS IoT MQTT as the primary live-state update path.
     mqtt_debug = bool(entry.options.get(CONF_MQTT_DEBUG, False))
 
     api.mqtt_debug = mqtt_debug
@@ -457,6 +459,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         try:
             connected = await hass.async_add_executor_job(api.connect_mqtt)
             if connected and coordinator.data:
+                coordinator.set_push_primary(True)
                 for sn in coordinator.data.keys():
                     # AWS IoT callbacks arrive on a background thread.
                     # Ensure coordinator updates happen on the HA event loop.
@@ -466,8 +469,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.async_add_executor_job(api.request_shadow, sn)
                 _LOGGER.info("MQTT connected and subscriptions registered")
             else:
+                coordinator.set_push_primary(False)
                 _LOGGER.warning("MQTT connection could not be established; continuing in REST polling mode")
         except Exception as err:
+            coordinator.set_push_primary(False)
             _LOGGER.warning("MQTT setup failed; continuing in REST polling mode: %s", err)
 
     _LOGGER.info("Aiper integration setup complete")

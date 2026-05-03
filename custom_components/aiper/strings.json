@@ -31,12 +31,12 @@
     "step": {
       "init": {
         "title": "Aiper Options",
-        "description": "Optional settings for polling, offline command behavior, and MQTT real-time updates (beta).",
+        "description": "Optional settings for MQTT push updates, REST fallback polling, and offline command behavior.",
         "data": {
-          "enable_mqtt": "Enable MQTT (beta)",
-          "mqtt_debug": "MQTT debug logging (beta)",
+          "enable_mqtt": "Enable MQTT push updates",
+          "mqtt_debug": "MQTT debug logging",
           "queue_offline_commands": "Queue commands while device is offline (advanced)",
-          "poll_interval": "Polling interval (seconds)"
+          "poll_interval": "REST fallback polling interval (seconds)"
         }
       }
     }

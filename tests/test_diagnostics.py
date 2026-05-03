@@ -29,6 +29,7 @@ async def test_diagnostics_redacts_sensitive_runtime_data() -> None:
         _iot_endpoint="abcdefghijk.iot.eu-central-1.amazonaws.com",
         _identity_id="eu-central-1:1234567890",
         _aws_region="eu-central-1",
+        _mqtt_client=SimpleNamespace(last_error=None, reconnect_count=1),
         is_mqtt_connected=lambda: True,
     )
     coordinator = SimpleNamespace(
@@ -64,3 +65,5 @@ async def test_diagnostics_redacts_sensitive_runtime_data() -> None:
     assert diagnostics["devices"]["SN123"]["nested"]["SecretKey"] == "***"
     assert diagnostics["command_state"]["SN123"]["pending"]["mode"]["accessKeyId"] == "***"
     assert diagnostics["command_state"]["SN123"]["pending"]["mode"]["value"] == 1
+    assert diagnostics["api"]["mqtt_client"] == "SimpleNamespace"
+    assert diagnostics["api"]["mqtt_reconnect_count"] == 1

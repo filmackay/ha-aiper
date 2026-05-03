@@ -13,6 +13,7 @@ This changelog tracks local modernization work intended for a future pull reques
 - Added service dispatch tests for the raw AT-command service across multiple loaded config entries.
 - Added Australia as a first-class region option backed by the Asia/Pacific Aiper API.
 - Added a Surfer S2 propeller maintenance timestamp sensor when the consumables endpoint reports propeller maintenance data.
+- Added AWS IoT Device SDK v2 MQTT transport for SigV4 WebSocket notifications.
 
 ### Changed
 
@@ -22,9 +23,13 @@ This changelog tracks local modernization work intended for a future pull reques
 - Refactored `aiper.send_at_command` to register once at integration setup and dynamically dispatch to the config entry that owns the requested serial number.
 - Cleaned up lint issues surfaced by the new Ruff configuration.
 - Gated Scuba-only clean-path and fallback mode controls so Surfer S2 does not inherit unproven control entities.
+- Replaced the legacy `AWSIoTPythonSDK` dependency with `awsiotsdk`.
+- Made MQTT the primary live-state update path when enabled, with REST polling retained as fallback and slow metadata reconciliation.
+- Updated the integration manifest IoT class to `cloud_push`.
 
 ### Fixed
 
 - Fixed config-flow test scaffolding so tests run through the `uv` managed Python environment.
 - Fixed Surfer S2 cleaning history parsing for long skimming runs that report explicit `cleanTimeMin` values.
 - Fixed `tools/aiper_probe.py` so `AIPER_REGION` is honored when `--region` is not provided.
+- Fixed AWS IoT MQTT connection setup by using the Cognito identity ID as the MQTT client ID required by Aiper's IoT policy.

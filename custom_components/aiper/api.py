@@ -38,6 +38,7 @@ from .const import (
 )
 
 from .crypto import AiperEncryption
+from .mqtt import AwsIotCredentials, AwsIotMqttTransport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -893,56 +894,44 @@ class AiperApi:
             return False
             
         try:
-            from AWSIoTPythonSDK.MQTTLib import AWSIoTMQTTClient
-            import certifi
-
             creds = self._get_aws_credentials()
             if not creds:
                 _LOGGER.error("Unable to obtain AWS credentials for MQTT")
                 return False
             
-            client_id = f"aiper-ha-{self._identity_id[:8]}"
-            self._mqtt_client = AWSIoTMQTTClient(client_id, useWebsocket=True)
-            self._mqtt_client.configureEndpoint(self._iot_endpoint, 443)
-            # Root CA bundle is required for TLS. certifi works well inside HA containers.
-            self._mqtt_client.configureCredentials(certifi.where())
-            # WebSocket SigV4 requires IAM creds.
-            self._mqtt_client.configureIAMCredentials(
-                creds["AccessKeyId"],
-                creds["SecretKey"],
-                creds.get("SessionToken", ""),
+            # Aiper's AWS IoT policy appears to bind Connect permission to the
+            # Cognito identity id. Prefixing or rewriting it causes AWS IoT to
+            # close the MQTT connection during CONNECT.
+            client_id = self._identity_id
+            region = self._aws_region
+            if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
+                region = self._iot_endpoint.split(".iot.", 1)[1].split(".", 1)[0]
+            region = region or "eu-central-1"
+
+            self._mqtt_client = AwsIotMqttTransport(
+                endpoint=self._iot_endpoint,
+                region=region,
+                client_id=client_id,
+                credentials=AwsIotCredentials(
+                    access_key_id=creds["AccessKeyId"],
+                    secret_access_key=creds["SecretKey"],
+                    session_token=creds.get("SessionToken", ""),
+                ),
+                connect_timeout=10.0,
+                operation_timeout=5.0,
             )
 
-            # Some SDK builds support explicit region configuration.
-            if hasattr(self._mqtt_client, "configureAWSRegion"):
-                try:
-                    region = self._aws_region
-                    if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
-                        region = self._iot_endpoint.split(".iot.", 1)[1].split(".", 1)[0]
-                    if region:
-                        self._mqtt_client.configureAWSRegion(region)
-                except Exception:
-                    pass
-            
-            # Configure connection parameters - use short timeouts
-            self._mqtt_client.configureAutoReconnectBackoffTime(1, 8, 5)
-            self._mqtt_client.configureOfflinePublishQueueing(-1)
-            self._mqtt_client.configureDrainingFrequency(2)
-            self._mqtt_client.configureConnectDisconnectTimeout(5)  # 5 second timeout
-            self._mqtt_client.configureMQTTOperationTimeout(3)
-            
             if self._mqtt_client.connect():
                 self._mqtt_connected = True
-                _LOGGER.info("Connected to AWS IoT MQTT")
+                _LOGGER.info("Connected to AWS IoT MQTT using AWS IoT Device SDK v2")
                 return True
             
+            self._mqtt_connected = False
             return False
             
-        except ImportError:
-            _LOGGER.error("AWSIoTPythonSDK not installed")
-            return False
         except Exception as err:
             _LOGGER.error("MQTT connection failed: %s", err)
+            self._mqtt_connected = False
             return False
 
     def is_mqtt_connected(self) -> bool:
@@ -950,16 +939,17 @@ class AiperApi:
 
         Exposed for entity availability and diagnostics.
         """
-        return bool(self._mqtt_connected and self._mqtt_client)
+        return bool(self._mqtt_connected and self._mqtt_client and self._mqtt_client.is_connected())
 
 
     def request_shadow(self, sn: str) -> bool:
         """Request the current AWS IoT thing shadow."""
-        if not self._mqtt_connected or not self._mqtt_client:
+        if not self.is_mqtt_connected():
             return False
         try:
             topic = TOPIC_SHADOW_GET_REQUEST.format(sn=sn)
-            self._mqtt_client.publish(topic, "", 1)
+            if not self._mqtt_client.publish(topic, "", 1):
+                return False
             _LOGGER.debug("Published shadow get request to %s", topic)
             return True
         except Exception as err:
@@ -990,13 +980,14 @@ class AiperApi:
         desired: dict
             Desired state fragment, e.g. {"Machine": {"mode": 0}}
         """
-        if not self._mqtt_connected or not self._mqtt_client:
+        if not self.is_mqtt_connected():
             return False
         try:
             topic = TOPIC_SHADOW_UPDATE.format(sn=sn)
             payload = {"state": {"desired": desired}}
             message = json.dumps(payload, separators=(",", ":"))
-            self._mqtt_client.publish(topic, message, 1)
+            if not self._mqtt_client.publish(topic, message, 1):
+                return False
             _LOGGER.debug("Published shadow update to %s: %s", topic, message)
             return True
         except Exception as err:
@@ -1005,7 +996,7 @@ class AiperApi:
 
     def subscribe_device(self, sn: str, callback: Callable[[dict], None]) -> bool:
         """Subscribe to device shadow updates."""
-        if not self._mqtt_connected:
+        if not self.is_mqtt_connected():
             _LOGGER.warning("MQTT not connected, cannot subscribe")
             return False
             
@@ -1018,9 +1009,9 @@ class AiperApi:
         is_x9 = any(sn.upper().startswith(prefix) for prefix in X9_SERIES_PREFIXES)
         report_topic = TOPIC_SHADOW_REPORT_X9 if is_x9 else TOPIC_SHADOW_REPORT
         
-        def on_message(client, userdata, message):
+        def on_message(topic: str, payload_bytes: bytes) -> None:
             try:
-                payload = self._decrypt(message.payload)
+                payload = self._decrypt(payload_bytes)
                 data = json.loads(payload)
 
                 # Track the device's reported timezone string (e.g. "UTC+3")
@@ -1053,13 +1044,10 @@ class AiperApi:
                 # Attach the MQTT topic so downstream handlers can distinguish
                 # between shadow/report, shadow/update/delta, and documents.
                 if isinstance(data, dict) and "_topic" not in data:
-                    try:
-                        data["_topic"] = getattr(message, "topic", "")
-                    except Exception:
-                        data["_topic"] = ""
+                    data["_topic"] = topic
 
                 if self.mqtt_debug:
-                    _LOGGER.debug("MQTT message topic=%s payload=%s", getattr(message, "topic", "?"), payload[:800])
+                    _LOGGER.debug("MQTT message topic=%s payload=%s", topic, payload[:800])
                 
                 with self._lock:
                     for cb in self._shadow_callbacks.get(sn, []):
@@ -1080,18 +1068,20 @@ class AiperApi:
         try:
             # Subscribe to shadow report topic
             topic = report_topic.format(sn=sn)
-            self._mqtt_client.subscribe(topic, 1, on_message)
-            _LOGGER.debug("Subscribed to %s", topic)
-
-            # Subscribe to additional topics (AWS IoT shadow and device uplink)
-            self._mqtt_client.subscribe(TOPIC_READ.format(sn=sn), 1, on_message)
-            self._mqtt_client.subscribe(TOPIC_SHADOW_GET.format(sn=sn), 1, on_message)
-            self._mqtt_client.subscribe(TOPIC_SHADOW_UPDATE_ACCEPTED.format(sn=sn), 1, on_message)
-            self._mqtt_client.subscribe(TOPIC_SHADOW_UPDATE_DELTA.format(sn=sn), 1, on_message)
-            self._mqtt_client.subscribe(TOPIC_SHADOW_UPDATE_DOCUMENTS.format(sn=sn), 1, on_message)
-
-            # Some models publish to app/report
-            self._mqtt_client.subscribe(TOPIC_SHADOW_REPORT_X9.format(sn=sn), 1, on_message)
+            topics = (
+                topic,
+                TOPIC_READ.format(sn=sn),
+                TOPIC_SHADOW_GET.format(sn=sn),
+                TOPIC_SHADOW_UPDATE_ACCEPTED.format(sn=sn),
+                TOPIC_SHADOW_UPDATE_DELTA.format(sn=sn),
+                TOPIC_SHADOW_UPDATE_DOCUMENTS.format(sn=sn),
+                # Some models publish to app/report.
+                TOPIC_SHADOW_REPORT_X9.format(sn=sn),
+            )
+            for sub_topic in topics:
+                if not self._mqtt_client.subscribe(sub_topic, on_message, 1):
+                    return False
+                _LOGGER.debug("Subscribed to %s", sub_topic)
             
             return True
             
@@ -1245,12 +1235,14 @@ class AiperApi:
         topic = TOPIC_WRITE.format(sn=sn)
 
         try:
-            if self._mqtt_connected and self._mqtt_client:
+            if self.is_mqtt_connected():
                 # Some firmware revisions accept plaintext JSON on downChan;
                 # others use the XOR+base64 encoded form. To maximize compatibility
                 # we publish both.
-                self._mqtt_client.publish(topic, message, 1)
-                self._mqtt_client.publish(topic, encrypted, 1)
+                published_plain = self._mqtt_client.publish(topic, message, 1)
+                published_encrypted = self._mqtt_client.publish(topic, encrypted, 1)
+                if not (published_plain or published_encrypted):
+                    return False
                 _LOGGER.debug(
                     "Sent command to %s: %s data=%s (plain+encrypted)",
                     sn,
@@ -1414,12 +1406,13 @@ class AiperApi:
 
     def disconnect(self) -> None:
         """Disconnect from MQTT and cleanup."""
-        if self._mqtt_client and self._mqtt_connected:
+        if self._mqtt_client:
             try:
                 self._mqtt_client.disconnect()
             except Exception:
                 pass
-            self._mqtt_connected = False
+        self._mqtt_connected = False
+        self._mqtt_client = None
         
         self._session.close()
         _LOGGER.info("Disconnected from Aiper API")

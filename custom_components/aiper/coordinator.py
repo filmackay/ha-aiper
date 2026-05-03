@@ -10,7 +10,16 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import AiperApi
-from .const import DEFAULT_SCAN_INTERVAL, DEFAULT_HISTORY_REFRESH_HOURS, DEFAULT_CONSUMABLES_REFRESH_HOURS, DEFAULT_CLEAN_PATH_REFRESH_HOURS, DOMAIN, MODE_MAP, CLEAN_PATH_LABEL_TO_VALUE
+from .const import (
+    CLEAN_PATH_LABEL_TO_VALUE,
+    DEFAULT_CLEAN_PATH_REFRESH_HOURS,
+    DEFAULT_CONSUMABLES_REFRESH_HOURS,
+    DEFAULT_HISTORY_REFRESH_HOURS,
+    DEFAULT_PUSH_RECONCILE_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    MODE_MAP,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,8 +33,8 @@ def _ensure_utc_aware(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-# Fast polling window used to reduce the perceived latency when the device
-# transitions from Offline -> Online. We keep this short to limit cloud API load.
+# Fast polling window used in REST fallback mode to reduce the perceived latency
+# when the device transitions from Offline -> Online.
 FAST_SCAN_INTERVAL_SECONDS = 5
 FAST_SCAN_WINDOW_SECONDS = 180
 
@@ -951,10 +960,14 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         history_refresh_hours: int = DEFAULT_HISTORY_REFRESH_HOURS,
         consumables_refresh_hours: int = DEFAULT_CONSUMABLES_REFRESH_HOURS,
         clean_path_refresh_hours: int = DEFAULT_CLEAN_PATH_REFRESH_HOURS,
+        push_primary: bool = False,
+        push_reconcile_interval: int = DEFAULT_PUSH_RECONCILE_INTERVAL,
     ) -> None:
         """Initialize the coordinator."""
         self._normal_interval = timedelta(seconds=max(5, int(scan_interval)))
         self._fast_interval = timedelta(seconds=FAST_SCAN_INTERVAL_SECONDS)
+        self._push_reconcile_interval = timedelta(seconds=max(300, int(push_reconcile_interval)))
+        self._push_primary = bool(push_primary)
         self._fast_poll_until: datetime | None = None
         self._last_online: dict[str, bool | None] = {}
         self._last_fast_trigger: datetime | None = None
@@ -963,7 +976,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=self._normal_interval,
+            update_interval=self._push_reconcile_interval if self._push_primary else self._normal_interval,
         )
         self.api = api
         self._devices: dict[str, dict] = {}
@@ -990,10 +1003,11 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _start_fast_poll_window(self, reason: str = "") -> None:
         """Enable a short fast-poll window and request an immediate refresh.
 
-        This is used when the device appears to have come online (typically
-        indicated by MQTT netstat updates) but the authoritative REST endpoint
-        has not yet reflected the change.
+        This is used in REST fallback mode when the device appears to have come
+        online via MQTT but the REST endpoint has not yet reflected the change.
         """
+        if self._push_primary:
+            return
         now = dt_util.utcnow()
         self._last_fast_trigger = _ensure_utc_aware(self._last_fast_trigger)
         # Throttle triggers to avoid storming the cloud API on noisy MQTT traffic.
@@ -1009,6 +1023,14 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # next refresh according to update_interval.
         self.hass.async_create_task(self.async_request_refresh())
 
+    def set_push_primary(self, enabled: bool) -> None:
+        """Switch between MQTT push-primary mode and REST polling fallback."""
+        self._push_primary = bool(enabled)
+        self._fast_poll_until = None
+        self.update_interval = self._push_reconcile_interval if self._push_primary else self._normal_interval
+        if getattr(self, "_listeners", None):
+            self._schedule_refresh()
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from API."""
         try:
@@ -1020,9 +1042,16 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for _sn, _ts in list(_d.items()):
                     _d[_sn] = _ensure_utc_aware(_ts) or dt_util.utcnow()
 
-            # Get device list
-            devices = await self.hass.async_add_executor_job(self.api.get_devices)
-            _LOGGER.debug("Got %d devices from API", len(devices))
+            # Bootstrap always uses REST discovery. Once MQTT is connected and
+            # push-primary mode is active, scheduled coordinator refreshes avoid
+            # polling live state and only reconcile slow cloud metadata.
+            metadata_only = self._push_primary and bool(self._devices)
+            if metadata_only:
+                devices = list(self._devices.values())
+                _LOGGER.debug("Reconciling slow REST metadata for %d MQTT-driven devices", len(devices))
+            else:
+                devices = await self.hass.async_add_executor_job(self.api.get_devices)
+                _LOGGER.debug("Got %d devices from API", len(devices))
             
             for device in devices:
                 sn = device.get("sn")
@@ -1031,28 +1060,35 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     
                 self._devices[sn] = device
                 
-                # Get device online status
                 status = None
-                try:
-                    status = await self.hass.async_add_executor_job(
-                        self.api.get_device_status, sn
-                    )
-                except Exception as err:
-                    _LOGGER.debug("Device %s status fetch failed: %s", sn, err)
+                if metadata_only:
+                    status = self._devices.get(sn, {}).get("status_data")
+                else:
+                    # Get device online status
+                    try:
+                        status = await self.hass.async_add_executor_job(
+                            self.api.get_device_status, sn
+                        )
+                    except Exception as err:
+                        _LOGGER.debug("Device %s status fetch failed: %s", sn, err)
                 if status:
                     self._devices[sn]["status_data"] = status
-                    if isinstance(status, dict):
+                    if isinstance(status, dict) and not metadata_only:
                         _LOGGER.debug("Device %s status online=%s", sn, status.get("online"))
-                    # Track last-seen when REST responds (even if device is Offline).
-                    self._devices[sn]["_ha_last_seen"] = now
-                # Get detailed device info (may contain state)
+                    if not metadata_only:
+                        # Track last-seen when REST responds (even if device is Offline).
+                        self._devices[sn]["_ha_last_seen"] = now
                 info = None
-                try:
-                    info = await self.hass.async_add_executor_job(
-                        self.api.get_device_info, sn
-                    )
-                except Exception as err:
-                    _LOGGER.debug("Device %s info fetch failed: %s", sn, err)
+                if metadata_only:
+                    info = self._devices.get(sn, {}).get("info")
+                else:
+                    # Get detailed device info (may contain state)
+                    try:
+                        info = await self.hass.async_add_executor_job(
+                            self.api.get_device_info, sn
+                        )
+                    except Exception as err:
+                        _LOGGER.debug("Device %s info fetch failed: %s", sn, err)
                 if info:
                     self._devices[sn]["info"] = info
 
@@ -1071,20 +1107,35 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 "online": 1 if info.get("online") else 0,
                             }
 
-                    # Track last-seen when REST responds.
-                    self._devices[sn]["_ha_last_seen"] = now
+                    if not metadata_only:
+                        # Track last-seen when REST responds.
+                        self._devices[sn]["_ha_last_seen"] = now
             
-                # Compute authoritative online state and squash stale connectivity fields when offline.
                 online_state = None
-                status_data = (self._devices.get(sn) or {}).get("status_data") or {}
-                if isinstance(status_data, dict) and "online" in status_data:
-                    online_state = _coerce_bool(status_data.get("online"))
-                if online_state is None and "online" in (self._devices.get(sn) or {}):
-                    online_state = _coerce_bool((self._devices.get(sn) or {}).get("online"))
-                if online_state is None and info and isinstance(info, dict) and "online" in info:
-                    online_state = _coerce_bool(info.get("online"))
+                if metadata_only:
+                    # MQTT is the primary live-state source in this mode. Do not
+                    # let stale REST status fields override shadow connectivity.
+                    shadow = self._shadow_data.get(sn) or {}
+                    netstat = shadow.get("netstat") or {}
+                    if isinstance(netstat, dict):
+                        online_state = _coerce_bool(netstat.get("online"))
+                    if online_state is None:
+                        online_state = self._last_online.get(sn)
+                    if online_state is None:
+                        online_state = _coerce_bool((self._devices.get(sn) or {}).get("_ha_online"))
+                else:
+                    # Compute authoritative online state from REST and squash stale
+                    # connectivity fields when offline.
+                    status_data = (self._devices.get(sn) or {}).get("status_data") or {}
+                    if isinstance(status_data, dict) and "online" in status_data:
+                        online_state = _coerce_bool(status_data.get("online"))
+                    if online_state is None and "online" in (self._devices.get(sn) or {}):
+                        online_state = _coerce_bool((self._devices.get(sn) or {}).get("online"))
+                    if online_state is None and info and isinstance(info, dict) and "online" in info:
+                        online_state = _coerce_bool(info.get("online"))
 
-                # Detect Offline -> Online transitions (authoritative REST only).
+                # Detect Offline -> Online transitions. In push-primary mode this
+                # is based on MQTT shadow connectivity; in fallback mode it is REST.
                 prev = self._last_online.get(sn)
                 sn_just_online = prev is False and online_state is True
                 if sn_just_online:
@@ -1297,8 +1348,8 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception:
                     pass
 
-            # Adapt polling cadence.
-            if transitioned_online:
+            # Adapt polling cadence in REST fallback mode.
+            if transitioned_online and not self._push_primary:
                 self._fast_poll_until = now + timedelta(seconds=FAST_SCAN_WINDOW_SECONDS)
                 self.update_interval = self._fast_interval
                 _LOGGER.debug(
@@ -1337,7 +1388,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         In the single-argument form, we attempt to extract the serial number
         from the payload ("_sn", "sn", or "data.sn").
 
-        AWSIoTPythonSDK invokes subscription callbacks on a background thread.
+        The AWS IoT SDK invokes subscription callbacks on a background thread.
         Home Assistant state updates must occur on the HA event loop.
         """
         if data is None and isinstance(sn, dict):
@@ -1364,7 +1415,7 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._apply_shadow_update(str(sn), data)
 
     def make_shadow_callback(self, sn: str):
-        """Return a callback suitable for AWSIoTPythonSDK subscribe()."""
+        """Return a callback suitable for AWS IoT MQTT subscriptions."""
 
         def _cb(data: dict) -> None:
             self.handle_shadow_update(sn, data)
@@ -1556,9 +1607,11 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if isinstance(payload.get("data"), dict):
                 _deep_merge(netstat, payload.get("data") or {})
 
-        # If MQTT indicates the device has just come online, start a short fast
-        # polling window so the authoritative REST status can catch up quickly.
+        # In REST fallback mode, if MQTT indicates the device has just come
+        # online, start a short fast polling window so REST can catch up quickly.
         curr_mqtt_online = _coerce_bool(netstat.get("online"))
+        if self._push_primary and curr_mqtt_online is not None:
+            self._last_online[sn] = curr_mqtt_online
         if prev_mqtt_online is not True and curr_mqtt_online is True:
             rest_online = None
             try:
@@ -1592,10 +1645,40 @@ class AiperDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:
             pass
 
+        # In push-primary mode, promote live shadow fields onto the device record
+        # so entities that historically preferred REST keys see MQTT updates first.
+        if self._push_primary:
+            device = dict(self._devices.get(sn, {}))
+            if curr_mqtt_online is not None:
+                device["_ha_online"] = curr_mqtt_online
+            if isinstance(machine, dict):
+                if machine.get("cap") is not None:
+                    device["battLevel"] = machine.get("cap")
+                if machine.get("status") is not None:
+                    device["machineStatus"] = machine.get("status")
+                if machine.get("mode") is not None:
+                    device["mode"] = machine.get("mode")
+            opinfo = shadow.get("opinfo") or {}
+            if isinstance(opinfo, dict):
+                if opinfo.get("wifi_name") is not None:
+                    device["wifiName"] = opinfo.get("wifi_name")
+                if opinfo.get("wifi_rssi") is not None:
+                    device["wifiRssi"] = opinfo.get("wifi_rssi")
+            ota = shadow.get("otastatus") or {}
+            if isinstance(ota, dict):
+                if ota.get("version") is not None:
+                    device["_ha_fw_main"] = ota.get("version")
+                if ota.get("subver") is not None:
+                    device["_ha_fw_mcu"] = ota.get("subver")
+            device["_ha_last_seen"] = dt_util.utcnow()
+            self._devices[sn] = device
+
         # Merge shadow into current coordinator data and notify listeners.
         if self.data is not None:
             new_data: dict[str, Any] = dict(self.data)
-            dev = dict(new_data.get(sn, {}))
+            dev = dict(new_data.get(sn, self._devices.get(sn, {})))
+            if self._push_primary:
+                dev.update(self._devices.get(sn, {}))
             dev["shadow"] = shadow
             new_data[sn] = dev
             self.async_set_updated_data(new_data)

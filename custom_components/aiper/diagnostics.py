@@ -46,11 +46,21 @@ async def async_get_config_entry_diagnostics(
 
     if api is not None:
         # Best-effort: include non-sensitive runtime details.
+        mqtt_client = getattr(api, "_mqtt_client", None)
         diag["api"].update(
             {
                 "iot_endpoint": redact_str(str(getattr(api, "_iot_endpoint", ""))) if getattr(api, "_iot_endpoint", None) else None,
                 "identity_id": redact_str(str(getattr(api, "_identity_id", ""))) if getattr(api, "_identity_id", None) else None,
                 "aws_region": getattr(api, "_aws_region", None),
+                "mqtt_client": type(mqtt_client).__name__ if mqtt_client is not None else None,
+                "mqtt_last_error": getattr(mqtt_client, "last_error", None) if mqtt_client is not None else None,
+                "mqtt_last_connected_at": getattr(mqtt_client, "last_connected_at", None)
+                if mqtt_client is not None
+                else None,
+                "mqtt_last_disconnected_at": getattr(mqtt_client, "last_disconnected_at", None)
+                if mqtt_client is not None
+                else None,
+                "mqtt_reconnect_count": getattr(mqtt_client, "reconnect_count", None) if mqtt_client is not None else None,
             }
         )
 

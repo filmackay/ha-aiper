@@ -113,6 +113,7 @@ X9_SERIES_PREFIXES = ["X9", "SE", "SL"]
 
 # Scan interval (seconds)
 DEFAULT_SCAN_INTERVAL = 120
+DEFAULT_PUSH_RECONCILE_INTERVAL = 3600
 
 # Connection timeout
 CONNECT_TIMEOUT = 10
