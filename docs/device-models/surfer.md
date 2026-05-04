@@ -152,8 +152,6 @@ runtime behavior without new evidence:
   for Surfer. The verified Surfer S2 relied on REST for persisted preference.
 - Whether return-to-charge or pause commands are exposed through the same AT
   command family.
-- Whether Australian accounts should be configured as `au` by users or whether
-  `asia` should be presented more explicitly in UI copy.
 
 ## At Risk
 

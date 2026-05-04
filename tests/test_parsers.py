@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import timezone
 
 from custom_components.aiper.coordinator import _clean_path_value, _parse_cleaning_history, _parse_consumables
-from custom_components.aiper.sensor import _collect_warning_codes, _normalize_warn_code
+from custom_components.aiper.sensor import (
+    _collect_warning_codes,
+    _get_centihours,
+    _get_hours,
+    _get_runtime_hours,
+    _normalize_warn_code,
+)
 
 
 def test_clean_path_value_normalizes_common_variants() -> None:
@@ -29,6 +35,24 @@ def test_warning_code_normalization_and_collection() -> None:
             "errorCode": "14",
         }
     ) == ["e12", "e13", "e14"]
+
+
+def test_runtime_hours_normalizes_centi_hour_payloads() -> None:
+    """Aiper reports runTime/run_time in centi-hours, not whole hours."""
+    assert _get_runtime_hours({"runTime": 1673}) == 16.73
+    assert _get_runtime_hours({"runTime": 1673.0}) == 16.73
+    assert _get_runtime_hours({"shadow": {"machine": {"run_time": "1645"}}}) == 16.45
+    assert _get_runtime_hours({"runTime": "16.73"}) is None
+    assert _get_runtime_hours({"runTime": None}) is None
+
+
+def test_hour_helpers_keep_field_units_explicit() -> None:
+    """Known hour and centi-hour fields should not share implicit parsing."""
+    data = {"runtimeHours": "16.73", "runTime": 1673}
+
+    assert _get_hours(data, ("runtimeHours",)) == 16.73
+    assert _get_centihours(data, ("runTime",)) == 16.73
+    assert _get_centihours(data, ("runtimeHours",)) is None
 
 
 def test_parse_cleaning_history_extracts_totals_and_records() -> None:

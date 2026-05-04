@@ -77,6 +77,66 @@ def _coerce_int(val: Any) -> int | None:
     return None
 
 
+def _centihours_to_hours(value: Any) -> float | None:
+    """Convert an integer centi-hour value to hours."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return round(value / 100.0, 2)
+    if isinstance(value, float) and value.is_integer():
+        return round(value / 100.0, 2)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.lstrip("-").isdigit():
+            return round(int(stripped) / 100.0, 2)
+    return None
+
+
+def _get_centihours(data: dict, *paths: tuple[str, ...]) -> float | None:
+    """Read the first present centi-hour field and convert it to hours."""
+    for path in paths:
+        current: Any = data
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current.get(key)
+        if current is not None:
+            return _centihours_to_hours(current)
+    return None
+
+
+def _get_hours(data: dict, *paths: tuple[str, ...]) -> float | None:
+    """Read the first present field that is already expressed in hours."""
+    for path in paths:
+        current: Any = data
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current.get(key)
+        if isinstance(current, bool) or current is None:
+            continue
+        if isinstance(current, (int, float)):
+            return round(float(current), 2)
+        if isinstance(current, str):
+            stripped = current.strip()
+            try:
+                return round(float(stripped), 2)
+            except ValueError:
+                continue
+    return None
+
+
+def _get_runtime_hours(data: dict) -> float | None:
+    """Return total runtime in hours from known centi-hour payload fields.
+
+    Aiper reports REST `runTime` and MQTT `run_time` as centi-hours on observed
+    Surfer payloads. For example, `1673` corresponds to `16.73 h`.
+    """
+    return _get_centihours(data, ("runTime",), ("shadow", "machine", "run_time"))
+
+
 def _is_online(data: dict) -> bool | None:
     """Best-effort online evaluation."""
     status_data = data.get("status_data") or {}
@@ -441,11 +501,7 @@ SENSOR_DESCRIPTIONS: tuple[AiperSensorEntityDescription, ...] = (
         icon="mdi:timer",
         native_unit_of_measurement="h",
         state_class=SensorStateClass.TOTAL_INCREASING,
-        value_fn=lambda data: (
-            data.get("runTime")
-            if data.get("runTime") is not None
-            else data.get("shadow", {}).get("machine", {}).get("run_time")
-        ),
+        value_fn=_get_runtime_hours,
         available_fn=lambda data: (
             data.get("runTime") is not None
             or data.get("shadow", {}).get("machine", {}).get("run_time") is not None

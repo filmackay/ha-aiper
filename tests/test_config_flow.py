@@ -98,20 +98,6 @@ async def test_validate_input_returns_title_and_device_count(hass: HomeAssistant
 
 
 @pytest.mark.asyncio
-async def test_validate_input_accepts_australia_region_alias(hass: HomeAssistant) -> None:
-    """Australia is a first-class region option backed by Asia/Pacific."""
-    data = {
-        CONF_USERNAME: "user@example.com",
-        CONF_PASSWORD: "secret",
-        CONF_REGION: "au",
-    }
-
-    await validate_input(hass, data)
-
-    assert FakeAiperApi.instances[0].region == "au"
-
-
-@pytest.mark.asyncio
 async def test_validate_input_raises_invalid_auth_when_login_fails(
     hass: HomeAssistant,
     fake_api: type[FakeAiperApi],

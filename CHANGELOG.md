@@ -11,7 +11,6 @@ This changelog tracks local modernization work intended for a future pull reques
 - Added local Home Assistant development runtime via `docker-compose.yml` and `ha-config/configuration.yaml`.
 - Added initial pytest suite covering config-flow validation helpers, diagnostics redaction, parser normalization, warning code handling, and consumable parsing.
 - Added service dispatch tests for the raw AT-command service across multiple loaded config entries.
-- Added Australia as a first-class region option backed by the Asia/Pacific Aiper API.
 - Added a Surfer S2 propeller maintenance timestamp sensor when the consumables endpoint reports propeller maintenance data.
 - Added AWS IoT Device SDK v2 MQTT transport for SigV4 WebSocket notifications.
 - Added model-family and capability profiles for Aiper's Scuba X1, Surfer S2, Shark devices.
