@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components import aiper
@@ -118,3 +121,51 @@ async def test_setup_entry_stores_runtime_data_and_unload_disconnects(
     assert unloaded == [(cast(ConfigEntry, entry), aiper.PLATFORMS)]
     assert api.disconnected is True
     assert entry.entry_id not in hass.data[DOMAIN]
+
+
+@pytest.mark.asyncio
+async def test_remove_config_entry_device_rejects_active_device(hass: HomeAssistant) -> None:
+    """HA should not delete a device that is still returned by Aiper."""
+    entry = MockConfigEntry(domain=DOMAIN, entry_id="entry-1")
+    entry.add_to_hass(hass)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "coordinator": SimpleNamespace(data={"SN123": {}}),
+    }
+
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "SN123")},
+        manufacturer="Aiper",
+        name="Pool Robot",
+    )
+
+    assert await aiper.async_remove_config_entry_device(hass, cast(ConfigEntry, entry), device) is False
+
+
+@pytest.mark.asyncio
+async def test_remove_config_entry_device_allows_stale_device(hass: HomeAssistant) -> None:
+    """HA should be allowed to delete stale device-registry entries."""
+    entry = MockConfigEntry(domain=DOMAIN, entry_id="entry-1")
+    entry.add_to_hass(hass)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "coordinator": SimpleNamespace(data={"SN123": {}}),
+    }
+
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "SN999")},
+        manufacturer="Aiper",
+        name="Old Pool Robot",
+    )
+    ent_reg = er.async_get(hass)
+    ent_reg.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        "SN999_status",
+        config_entry=cast(ConfigEntry, entry),
+        device_id=device.id,
+    )
+
+    assert await aiper.async_remove_config_entry_device(hass, cast(ConfigEntry, entry), device) is True

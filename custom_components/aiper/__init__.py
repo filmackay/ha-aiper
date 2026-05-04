@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -56,6 +57,46 @@ async def _options_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> N
     debug options consistently.
     """
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    device_entry: dr.DeviceEntry,
+) -> bool:
+    """Allow HA to remove stale Aiper device-registry entries."""
+    device_serials = {
+        identifier
+        for domain, identifier in device_entry.identifiers
+        if domain == DOMAIN and isinstance(identifier, str)
+    }
+
+    runtime_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id) or {}
+    coordinator = runtime_data.get("coordinator")
+    current_serials: set[str] = set()
+    coordinator_data = getattr(coordinator, "data", None)
+    if isinstance(coordinator_data, dict):
+        current_serials = {str(sn) for sn in coordinator_data}
+
+    if device_serials and device_serials & current_serials:
+        _LOGGER.info(
+            "Refusing to remove active Aiper device %s; serial is still present in coordinator data",
+            device_entry.name or device_entry.id,
+        )
+        return False
+
+    ent_reg = er.async_get(hass)
+    entities = er.async_entries_for_device(
+        ent_reg,
+        device_entry.id,
+        include_disabled_entities=True,
+    )
+    _LOGGER.info(
+        "Allowing removal of stale Aiper device %s with %d registered entities",
+        device_entry.name or device_entry.id,
+        len(entities),
+    )
+    return True
 
 
 def _is_mqtt_only_unique_id(unique_id: str) -> bool:
