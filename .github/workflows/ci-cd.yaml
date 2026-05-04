@@ -104,7 +104,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.version.outputs.tag }}"
-          zip -r aiper.zip custom_components/aiper
+          (cd custom_components/aiper && zip -r ../../aiper.zip . -x '*/__pycache__/*' '__pycache__/*' '*.pyc')
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${tag}" -m "${tag}"

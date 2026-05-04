@@ -87,6 +87,11 @@ The push triggers `.github/workflows/ci-cd.yaml`. The release job will only run
 when the quality job succeeds and the version does not already have a matching
 tag.
 
+The release asset must contain the contents of `custom_components/aiper` at the
+zip root. Do not package the parent `custom_components/aiper` path inside
+`aiper.zip`, or HACS will install it as
+`/config/custom_components/aiper/custom_components/aiper`.
+
 ## Follow CI/CD
 
 Find the new run and watch it:
